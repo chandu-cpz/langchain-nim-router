@@ -6,12 +6,47 @@ from typing import Any
 from nim_router.capabilities import infer_capabilities
 from nim_router.config import RouterConfig
 from nim_router.errors import ModelDiscoveryError
-from nim_router.schemas import ModelInfo
+from nim_router.schemas import ModelCapabilities, ModelInfo
 
 logger = logging.getLogger(__name__)
 
 # Lazy import to keep import time fast
 _chat_nvidia_cls: Any = None
+
+
+def _merge_capabilities(
+    raw_model: Any,
+    model_id: str,
+    overrides: dict[str, bool],
+) -> ModelCapabilities:
+    """Build capabilities with three-tier priority.
+
+    1. Raw API metadata (lowest — may be incomplete)
+    2. Built-in profile (fills gaps where API says False)
+    3. Env / programmatic overrides (highest)
+
+    A capability is True if ANY source says True.
+    """
+    # Layer 1: raw metadata
+    api_caps = infer_capabilities(raw_model)
+
+    # Layer 2: built-in profile
+    profile = DEFAULT_MODEL_PROFILES.get(model_id)
+
+    result = ModelCapabilities()
+    for field_name in ("tools", "structured", "vision", "reasoning"):
+        api_val = getattr(api_caps, field_name, False)
+        profile_val = bool(profile.get(field_name, False)) if profile else False
+        override_val = overrides.get(field_name) if field_name in overrides else None
+
+        if override_val is not None:
+            # Env/programmatic override wins outright
+            setattr(result, field_name, bool(override_val))
+        else:
+            # API metadata OR built-in profile (either True → True)
+            setattr(result, field_name, api_val or profile_val)
+
+    return result
 
 # Built-in profiles for well-known NIM models.
 # quality: 0-1 hint used by scoring when no runtime history exists.
@@ -152,9 +187,9 @@ class ModelRegistry:
             # Deprecated models
             deprecated = bool(getattr(raw, "deprecated", False))
 
-            # Build capabilities
+            # Build capabilities: raw API metadata → built-in profile → env override
             cap_overrides = self.config.capabilities_overrides.get(model_id, {})
-            capabilities = infer_capabilities(raw, cap_overrides)
+            capabilities = _merge_capabilities(raw, model_id, cap_overrides)
 
             # Quality hint: env override > built-in profile > neutral default
             profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
@@ -185,22 +220,25 @@ class ModelRegistry:
         if excluded:
             models = [m for m in models if m.id not in excluded]
 
-        # Apply capability overrides for models not discovered from API
-        for model_id, overrides in self.config.capabilities_overrides.items():
-            if any(m.id == model_id for m in models):
-                continue
-            capabilities = infer_capabilities({}, overrides)
-            profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
-            quality_hint = self.config.quality_hints.get(
-                model_id, profile.get("quality", 0.5)
-            )
-            models.append(
-                ModelInfo(
-                    id=model_id,
-                    capabilities=capabilities,
-                    quality_hint=quality_hint,
+        # Apply capability overrides for models not discovered from API.
+        # Only appended when allow_undiscovered_models is True — prevents
+        # typos in config from silently creating phantom models that 404.
+        if self.config.allow_undiscovered_models:
+            for model_id, overrides in self.config.capabilities_overrides.items():
+                if any(m.id == model_id for m in models):
+                    continue
+                capabilities = infer_capabilities({}, overrides)
+                profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
+                quality_hint = self.config.quality_hints.get(
+                    model_id, profile.get("quality", 0.5)
                 )
-            )
+                models.append(
+                    ModelInfo(
+                        id=model_id,
+                        capabilities=capabilities,
+                        quality_hint=quality_hint,
+                    )
+                )
 
         # Apply quality hints for models not yet seen
         for model_id, hint in self.config.quality_hints.items():

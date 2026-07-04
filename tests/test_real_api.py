@@ -143,8 +143,13 @@ class TestRealPick:
 
 class TestRealGet:
     @pytest.mark.asyncio
-    async def test_get_returns_tracked_llm(self, router):
+    async def test_get_returns_chat_nvidia(self, router):
         llm = await router.get(tools=True, temperature=0.7)
+        assert type(llm).__name__ == "ChatNVIDIA"
+
+    @pytest.mark.asyncio
+    async def test_get_tracked_returns_tracked_llm(self, router):
+        llm = await router.get_tracked(tools=True, temperature=0.7)
         assert type(llm).__name__ == "TrackedLLM"
         assert type(llm.llm).__name__ == "ChatNVIDIA"
 
@@ -156,8 +161,7 @@ class TestRealGet:
             top_p=0.9,
             max_completion_tokens=512,
         )
-        assert type(llm).__name__ == "TrackedLLM"
-        assert type(llm.llm).__name__ == "ChatNVIDIA"
+        assert type(llm).__name__ == "ChatNVIDIA"
 
 
 # =============================================================================

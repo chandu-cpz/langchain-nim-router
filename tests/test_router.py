@@ -259,14 +259,14 @@ class TestTimeoutCooldown:
 
 class TestGetRaw:
     @pytest.mark.asyncio
-    async def test_get_raw_returns_bare_llm(self, router_with_mock):
+    async def test_get_returns_bare_llm(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
 
         with patch("nim_router.router.create_chat_nvidia") as mock_create:
             mock_llm = MagicMock()
             mock_create.return_value = mock_llm
-            result = await router_with_mock.get_raw(tools=True)
+            result = await router_with_mock.get(tools=True)
             assert result is mock_llm
 
 
@@ -327,7 +327,7 @@ class TestTrackedLLM:
             mock_llm.ainvoke = AsyncMock(return_value=mock_result)
             mock_create.return_value = mock_llm
 
-            tracked = await router_with_mock.get(tools=True)
+            tracked = await router_with_mock.get_tracked(tools=True)
             result = await tracked.ainvoke([{"role": "user", "content": "hi"}])
             assert result is mock_result
             stats = router_with_mock.stats_store.get_stats(tracked.model_id)
@@ -343,7 +343,7 @@ class TestTrackedLLM:
             mock_llm.ainvoke = AsyncMock(side_effect=Exception("429"))
             mock_create.return_value = mock_llm
 
-            tracked = await router_with_mock.get(tools=True)
+            tracked = await router_with_mock.get_tracked(tools=True)
             with pytest.raises(Exception, match="429"):
                 await tracked.ainvoke([{"role": "user", "content": "hi"}])
             stats = router_with_mock.stats_store.get_stats(tracked.model_id)
@@ -359,13 +359,72 @@ class TestTrackedLLM:
             mock_llm.custom_attr = "hello"
             mock_create.return_value = mock_llm
 
-            tracked = await router_with_mock.get(tools=True)
+            tracked = await router_with_mock.get_tracked(tools=True)
             assert tracked.custom_attr == "hello"
+
+    @pytest.mark.asyncio
+    async def test_tracked_with_structured_output_wraps(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_structured = MagicMock()
+            mock_structured.ainvoke = AsyncMock(return_value="ok")
+            mock_llm.with_structured_output.return_value = mock_structured
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get_tracked(tools=True)
+            result = tracked.with_structured_output({"type": "object"})
+            from nim_router.router import TrackedLLM
+            assert isinstance(result, TrackedLLM)
+            assert result._structured is True
+            # Invoke through the structured wrapper still tracks
+            await result.ainvoke("hi")
+            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
+            assert stats.successes >= 1
+
+    @pytest.mark.asyncio
+    async def test_tracked_bind_tools_wraps(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_bound = MagicMock()
+            mock_bound.ainvoke = AsyncMock(return_value="ok")
+            mock_llm.bind_tools.return_value = mock_bound
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get_tracked(tools=True)
+            result = tracked.bind_tools([{"type": "function"}])
+            from nim_router.router import TrackedLLM
+            assert isinstance(result, TrackedLLM)
+            assert result._tools is True
+
+    @pytest.mark.asyncio
+    async def test_tracked_invoke_marks_rate_limit(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_llm.invoke.return_value = "ok"
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get_tracked(tools=True)
+            # pick() should NOT have marked a request
+            state = router_with_mock.limiter.get_state(tracked.model_id)
+            assert len(state.recent_request_timestamps) == 0
+            # invoke() should mark a request
+            tracked.invoke("hi")
+            state = router_with_mock.limiter.get_state(tracked.model_id)
+            assert len(state.recent_request_timestamps) == 1
 
 
 class TestGet:
     @pytest.mark.asyncio
-    async def test_get_returns_tracked(self, router_with_mock):
+    async def test_get_returns_raw(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
 
@@ -375,15 +434,26 @@ class TestGet:
             result = await router_with_mock.get(
                 tools=True, temperature=0.7, top_p=0.9, max_completion_tokens=1024
             )
-            # get() now returns TrackedLLM wrapping the raw LLM
-            from nim_router.router import TrackedLLM
-            assert isinstance(result, TrackedLLM)
-            assert result.llm is mock_llm
+            # get() returns bare ChatNVIDIA
+            assert result is mock_llm
             call_args = mock_create.call_args
             assert call_args[1]["model_id"] is not None
             assert call_args[1]["temperature"] == 0.7
             assert call_args[1]["top_p"] == 0.9
             assert call_args[1]["max_completion_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_get_tracked_returns_tracked(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+            result = await router_with_mock.get_tracked(tools=True)
+            from nim_router.router import TrackedLLM
+            assert isinstance(result, TrackedLLM)
+            assert result.llm is mock_llm
 
 
 class TestEnvConfig:
@@ -426,6 +496,30 @@ class TestEnvConfig:
                     del os.environ[key]
             config = RouterConfig.from_env()
             assert config.quality_hints["model-a"] == 0.95
+
+
+class TestAllowUndiscovered:
+    @pytest.mark.asyncio
+    async def test_override_only_model_not_added_by_default(self, mock_chat_nvidia_cls):
+        config = RouterConfig(
+            capabilities_overrides={"phantom/model": {"tools": True}},
+            allow_undiscovered_models=False,
+        )
+        with patch("nim_router.registry._get_chat_nvidia_cls", return_value=mock_chat_nvidia_cls):
+            r = NimRouter(config=config)
+            await r.registry.ensure_loaded()
+            assert not any(m.id == "phantom/model" for m in r.registry.models)
+
+    @pytest.mark.asyncio
+    async def test_override_only_model_added_when_enabled(self, mock_chat_nvidia_cls):
+        config = RouterConfig(
+            capabilities_overrides={"phantom/model": {"tools": True}},
+            allow_undiscovered_models=True,
+        )
+        with patch("nim_router.registry._get_chat_nvidia_cls", return_value=mock_chat_nvidia_cls):
+            r = NimRouter(config=config)
+            await r.registry.ensure_loaded()
+            assert any(m.id == "phantom/model" for m in r.registry.models)
 
 
 def _build_model_infos() -> list[ModelInfo]:

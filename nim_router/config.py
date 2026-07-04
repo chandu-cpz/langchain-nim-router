@@ -16,6 +16,7 @@ class RouterConfig(BaseModel):
     quality_hints: dict[str, float] = Field(default_factory=dict)
     timeout_seconds: float = 120.0
     stats_path: str | None = None
+    allow_undiscovered_models: bool = False
 
     @classmethod
     def from_env(cls) -> RouterConfig:
@@ -29,6 +30,9 @@ class RouterConfig(BaseModel):
             quality_hints=_parse_json("NIM_ROUTER_QUALITY_HINTS_JSON", {}),
             timeout_seconds=_parse_float("NIM_ROUTER_TIMEOUT_SECONDS", 120.0),
             stats_path=os.environ.get("NIM_ROUTER_STATS_PATH"),
+            allow_undiscovered_models=bool(
+                os.environ.get("NIM_ROUTER_ALLOW_UNDISCOVERED", "")
+            ),
         )
 
 

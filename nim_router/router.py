@@ -37,7 +37,6 @@ class NimRouter:
         else:
             self.config = RouterConfig.from_env()
 
-        # Allow overriding individual config fields
         for key, val in config_overrides.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, val)
@@ -62,12 +61,49 @@ class NimRouter:
         temperature: float | None = None,
         top_p: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Pick a model and return a bare ChatNVIDIA instance.
+
+        Returns the real langchain ChatNVIDIA object so it works everywhere
+        LangChain expects a ``BaseChatModel`` (LangGraph, ``with_structured_output``,
+        ``bind_tools``, ``|`` pipeline composition, etc.).
+
+        Use :meth:`get_tracked` if you want automatic latency/error recording.
+        """
+        info = await self.pick(
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            priority=priority,
+        )
+        return create_chat_nvidia(
+            model_id=info.id,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            timeout=self.config.timeout_seconds,
+            model_kwargs=model_kwargs,
+        )
+
+    async def get_tracked(
+        self,
+        *,
+        tools: bool = False,
+        structured: bool = False,
+        vision: bool = False,
+        reasoning: bool = False,
+        priority: Literal["fast", "quality", "balanced"] = "balanced",
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        model_kwargs: dict[str, Any] | None = None,
     ) -> TrackedLLM:
         """Pick a model and return a TrackedLLM that auto-records every call.
 
-        The returned object behaves like a normal ChatNVIDIA — use
-        ``invoke()`` / ``ainvoke()`` as usual.  Latency and errors are
-        reported to the stats store automatically.
+        The returned wrapper records latency and errors on each
+        ``invoke()`` / ``ainvoke()`` call.  It also reserves a rate-limit
+        slot per actual invocation rather than at pick-time.
         """
         info = await self.pick(
             tools=tools,
@@ -93,36 +129,6 @@ class NimRouter:
             vision=vision,
         )
 
-    async def get_raw(
-        self,
-        *,
-        tools: bool = False,
-        structured: bool = False,
-        vision: bool = False,
-        reasoning: bool = False,
-        priority: Literal["fast", "quality", "balanced"] = "balanced",
-        max_completion_tokens: int | None = None,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        model_kwargs: dict[str, Any] | None = None,
-    ) -> Any:
-        """Pick a model and return a bare ChatNVIDIA (no auto-tracking)."""
-        info = await self.pick(
-            tools=tools,
-            structured=structured,
-            vision=vision,
-            reasoning=reasoning,
-            priority=priority,
-        )
-        return create_chat_nvidia(
-            model_id=info.id,
-            temperature=temperature,
-            top_p=top_p,
-            max_completion_tokens=max_completion_tokens,
-            timeout=self.config.timeout_seconds,
-            model_kwargs=model_kwargs,
-        )
-
     async def ainvoke(
         self,
         messages: list[Any],
@@ -137,7 +143,12 @@ class NimRouter:
         top_p: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Pick a model, invoke it, and auto-record success/failure."""
+        """Pick a model, invoke it, and auto-record success/failure.
+
+        This is the recommended one-shot API: it reserves a rate-limit
+        slot, measures latency, records stats, and applies cooldowns on
+        failure — all in a single call.
+        """
         info = await self.pick(
             tools=tools,
             structured=structured,
@@ -153,6 +164,7 @@ class NimRouter:
             timeout=self.config.timeout_seconds,
             model_kwargs=model_kwargs,
         )
+        self.limiter.mark_request(info.id)
         t0 = time.monotonic()
         try:
             result = await llm.ainvoke(messages)
@@ -188,6 +200,10 @@ class NimRouter:
 
         Acquires an asyncio lock so concurrent callers don't double-reserve
         the same rate-limited model.
+
+        Note: ``pick()`` does NOT reserve a rate-limit slot.  Reservation
+        happens at invoke-time (inside ``TrackedLLM`` / ``ainvoke()``) so
+        that unused picks don't waste quota.
         """
         async with self._pick_lock:
             models = await self.registry.ensure_loaded()
@@ -216,12 +232,7 @@ class NimRouter:
             scored = score_models(
                 candidates, self.stats_store, priority, required=required
             )
-            best_model = scored[0][0]
-
-            # Mark request in limiter while still holding the lock
-            self.limiter.mark_request(best_model.id)
-
-            return best_model
+            return scored[0][0]
 
     def record_success(
         self,
@@ -357,8 +368,15 @@ def _capabilities_satisfy(required: ModelCapabilities, provided: ModelCapabiliti
 class TrackedLLM:
     """Wrapper around a ChatNVIDIA instance that auto-records success/failure.
 
-    Use ``ainvoke()`` exactly like the underlying LLM — latency and errors
-    are automatically reported back to the router's stats store.
+    Each ``invoke()`` / ``ainvoke()`` call:
+    1. Reserves a rate-limit slot (so repeated calls on the same handle
+       each count against RPM).
+    2. Measures wall-clock latency.
+    3. Records success or failure back to the router's stats store.
+
+    Composition methods (``with_structured_output``, ``bind_tools``) return
+    new ``TrackedLLM`` wrappers so that tracking survives LangChain
+    composition chains.
     """
 
     def __init__(
@@ -389,6 +407,7 @@ class TrackedLLM:
 
     def invoke(self, messages: Any, **kwargs: Any) -> Any:
         """Synchronous invoke with auto-tracking."""
+        self._router.limiter.mark_request(self._model_id)
         t0 = time.monotonic()
         try:
             result = self._llm.invoke(messages, **kwargs)
@@ -412,6 +431,7 @@ class TrackedLLM:
 
     async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
         """Async invoke with auto-tracking."""
+        self._router.limiter.mark_request(self._model_id)
         t0 = time.monotonic()
         try:
             result = await self._llm.ainvoke(messages, **kwargs)
@@ -432,6 +452,68 @@ class TrackedLLM:
                 vision=self._vision,
             )
             raise
+
+    # ── Composition wrappers ─────────────────────────────────────────
+    # These ensure tracking survives LangChain chains like:
+    #   llm = await router.get_tracked(structured=True)
+    #   chain = llm.with_structured_output(MySchema)
+    #   result = await chain.ainvoke(...)  # still tracked
+
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> TrackedLLM:
+        """Return a tracked wrapper around ``llm.with_structured_output()``."""
+        inner = self._llm.with_structured_output(schema, **kwargs)
+        return TrackedLLM(
+            llm=inner,
+            router=self._router,
+            model_id=self._model_id,
+            structured=True,
+            tools=self._tools,
+            vision=self._vision,
+        )
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> TrackedLLM:
+        """Return a tracked wrapper around ``llm.bind_tools()``."""
+        inner = self._llm.bind_tools(tools, **kwargs)
+        return TrackedLLM(
+            llm=inner,
+            router=self._router,
+            model_id=self._model_id,
+            structured=self._structured,
+            tools=True,
+            vision=self._vision,
+        )
+
+    def with_retry(self, **kwargs: Any) -> TrackedLLM:
+        """Return a tracked wrapper around ``llm.with_retry()``."""
+        inner = self._llm.with_retry(**kwargs)
+        return TrackedLLM(
+            llm=inner,
+            router=self._router,
+            model_id=self._model_id,
+            structured=self._structured,
+            tools=self._tools,
+            vision=self._vision,
+        )
+
+    def with_config(self, **kwargs: Any) -> TrackedLLM:
+        """Return a tracked wrapper around ``llm.with_config()``."""
+        inner = self._llm.with_config(**kwargs)
+        return TrackedLLM(
+            llm=inner,
+            router=self._router,
+            model_id=self._model_id,
+            structured=self._structured,
+            tools=self._tools,
+            vision=self._vision,
+        )
+
+    def __or__(self, other: Any) -> Any:
+        """Support ``tracked_llm | prompt`` pipeline composition.
+
+        Returns the raw composed runnable — tracking is lost for piped
+        chains.  Use ``ainvoke()`` directly when you need stats.
+        """
+        return self._llm | other
 
     def __getattr__(self, name: str) -> Any:
         """Delegate attribute access to the underlying LLM."""
