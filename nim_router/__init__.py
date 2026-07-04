@@ -7,7 +7,7 @@ from nim_router.errors import (
     NoUsableModelError,
     classify_error,
 )
-from nim_router.router import NimRouter
+from nim_router.router import NimRouter, TrackedLLM
 from nim_router.schemas import (
     ModelCapabilities,
     ModelInfo,
@@ -17,6 +17,7 @@ from nim_router.schemas import (
 
 __all__ = [
     "NimRouter",
+    "TrackedLLM",
     "NimRouterError",
     "NoUsableModelError",
     "ModelDiscoveryError",

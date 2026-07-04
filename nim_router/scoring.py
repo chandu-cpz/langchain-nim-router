@@ -54,12 +54,18 @@ def score_models(
     candidates: list[ModelInfo],
     stats_store: StatsStore,
     priority: str = "balanced",
+    *,
+    required: ModelCapabilities | None = None,
 ) -> list[tuple[ModelInfo, float]]:
-    """Score and rank candidate models. Returns sorted (model, score) tuples."""
+    """Score and rank candidate models. Returns sorted (model, score) tuples.
+
+    When *required* is provided the score is penalised by the model's
+    capability-specific success rate for each requested capability.
+    """
     scored: list[tuple[ModelInfo, float]] = []
     for model in candidates:
         stats = stats_store.get_stats(model.id)
-        score = _compute_score(model, stats, priority)
+        score = _compute_score(model, stats, priority, required=required)
         scored.append((model, score))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored
@@ -69,6 +75,8 @@ def _compute_score(
     model: ModelInfo,
     stats: ModelRuntimeStats,
     priority: str,
+    *,
+    required: ModelCapabilities | None = None,
 ) -> float:
     # Get normalized components
     success = stats.success_rate
@@ -77,26 +85,37 @@ def _compute_score(
     quality = model.quality_hint
 
     if priority == "fast":
-        return (
+        base = (
             0.40 * tok_speed
             + 0.30 * (1.0 - latency)
             + 0.20 * success
             + 0.10 * quality
         )
     elif priority == "quality":
-        return (
+        base = (
             0.40 * quality
             + 0.30 * success
             + 0.15 * tok_speed
             + 0.15 * (1.0 - latency)
         )
     else:  # balanced
-        return (
+        base = (
             0.25 * quality
             + 0.25 * success
             + 0.25 * tok_speed
             + 0.25 * (1.0 - latency)
         )
+
+    # Apply capability-specific penalties
+    if required is not None:
+        if required.structured:
+            base *= stats.structured_success_rate
+        if required.tools:
+            base *= stats.tool_success_rate
+        if required.vision:
+            base *= stats.vision_success_rate
+
+    return base
 
 
 def _normalize_latency(latency: float | None) -> float:

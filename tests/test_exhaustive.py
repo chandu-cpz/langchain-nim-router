@@ -568,7 +568,7 @@ class TestRecordFailureAllKinds:
         router.registry._loaded = True
         router.registry._models = [ModelInfo(id="m1")]
         router.record_failure("m1", kind=ErrorKind.TIMEOUT)
-        assert not router.stats_store.is_cooling_down("m1")
+        assert router.stats_store.is_cooling_down("m1")
         assert not router.stats_store.is_banned("m1")
 
     def test_generic_error(self, router):

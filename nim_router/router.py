@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, Literal
 
 from nim_router.client import create_chat_nvidia
@@ -17,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Default cooldown periods
 _RATE_LIMIT_COOLDOWN = 30.0
 _HTTP_ERROR_COOLDOWN = 10.0
+_TIMEOUT_COOLDOWN = 20.0
 _MODEL_NOT_FOUND_BAN = True
 
 
@@ -45,6 +48,7 @@ class NimRouter:
         self.registry = ModelRegistry(self.config)
         self.limiter = RateLimiter(self.config)
         self.stats_store = StatsStore(stats_path=self.config.stats_path)
+        self._pick_lock = asyncio.Lock()
 
     async def get(
         self,
@@ -58,8 +62,51 @@ class NimRouter:
         temperature: float | None = None,
         top_p: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
+    ) -> TrackedLLM:
+        """Pick a model and return a TrackedLLM that auto-records every call.
+
+        The returned object behaves like a normal ChatNVIDIA — use
+        ``invoke()`` / ``ainvoke()`` as usual.  Latency and errors are
+        reported to the stats store automatically.
+        """
+        info = await self.pick(
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            priority=priority,
+        )
+        llm = create_chat_nvidia(
+            model_id=info.id,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            timeout=self.config.timeout_seconds,
+            model_kwargs=model_kwargs,
+        )
+        return TrackedLLM(
+            llm=llm,
+            router=self,
+            model_id=info.id,
+            structured=structured,
+            tools=tools,
+            vision=vision,
+        )
+
+    async def get_raw(
+        self,
+        *,
+        tools: bool = False,
+        structured: bool = False,
+        vision: bool = False,
+        reasoning: bool = False,
+        priority: Literal["fast", "quality", "balanced"] = "balanced",
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        model_kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Pick a model and return a configured ChatNVIDIA instance."""
+        """Pick a model and return a bare ChatNVIDIA (no auto-tracking)."""
         info = await self.pick(
             tools=tools,
             structured=structured,
@@ -76,6 +123,58 @@ class NimRouter:
             model_kwargs=model_kwargs,
         )
 
+    async def ainvoke(
+        self,
+        messages: list[Any],
+        *,
+        tools: bool = False,
+        structured: bool = False,
+        vision: bool = False,
+        reasoning: bool = False,
+        priority: Literal["fast", "quality", "balanced"] = "balanced",
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        model_kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Pick a model, invoke it, and auto-record success/failure."""
+        info = await self.pick(
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            priority=priority,
+        )
+        llm = create_chat_nvidia(
+            model_id=info.id,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            timeout=self.config.timeout_seconds,
+            model_kwargs=model_kwargs,
+        )
+        t0 = time.monotonic()
+        try:
+            result = await llm.ainvoke(messages)
+            latency = time.monotonic() - t0
+            self.record_success(
+                info.id,
+                latency=latency,
+                structured=structured,
+                tools=tools,
+                vision=vision,
+            )
+            return result
+        except Exception as exc:
+            self.record_failure(
+                info.id,
+                error=exc,
+                structured=structured,
+                tools=tools,
+                vision=vision,
+            )
+            raise
+
     async def pick(
         self,
         *,
@@ -85,35 +184,44 @@ class NimRouter:
         reasoning: bool = False,
         priority: Literal["fast", "quality", "balanced"] = "balanced",
     ) -> ModelInfo:
-        """Select the best model and return its metadata."""
-        models = await self.registry.ensure_loaded()
+        """Select the best model and return its metadata.
 
-        required = ModelCapabilities(
-            tools=tools,
-            structured=structured,
-            vision=vision,
-            reasoning=reasoning,
-        )
+        Acquires an asyncio lock so concurrent callers don't double-reserve
+        the same rate-limited model.
+        """
+        async with self._pick_lock:
+            models = await self.registry.ensure_loaded()
 
-        candidates = filter_candidates(models, required, self.limiter, self.stats_store)
-
-        if not candidates:
-            reasons = self._build_exclusion_reasons(models, required)
-            req_dict = required.model_dump()
-            raise NoUsableModelError(
-                f"No usable model found for capabilities: {req_dict}. "
-                f"Exclusion reasons: {reasons}",
-                required_capabilities=req_dict,
-                excluded_reasons=reasons,
+            required = ModelCapabilities(
+                tools=tools,
+                structured=structured,
+                vision=vision,
+                reasoning=reasoning,
             )
 
-        scored = score_models(candidates, self.stats_store, priority)
-        best_model = scored[0][0]
+            candidates = filter_candidates(
+                models, required, self.limiter, self.stats_store
+            )
 
-        # Mark request in limiter
-        self.limiter.mark_request(best_model.id)
+            if not candidates:
+                reasons = self._build_exclusion_reasons(models, required)
+                req_dict = required.model_dump()
+                raise NoUsableModelError(
+                    f"No usable model found for capabilities: {req_dict}. "
+                    f"Exclusion reasons: {reasons}",
+                    required_capabilities=req_dict,
+                    excluded_reasons=reasons,
+                )
 
-        return best_model
+            scored = score_models(
+                candidates, self.stats_store, priority, required=required
+            )
+            best_model = scored[0][0]
+
+            # Mark request in limiter while still holding the lock
+            self.limiter.mark_request(best_model.id)
+
+            return best_model
 
     def record_success(
         self,
@@ -167,6 +275,9 @@ class NimRouter:
         elif kind == ErrorKind.MODEL_NOT_FOUND:
             self.stats_store.ban_model(model_id)
             logger.warning("Model %s banned (model not found)", model_id)
+        elif kind == ErrorKind.TIMEOUT:
+            self.limiter.cooldown(model_id, _TIMEOUT_COOLDOWN)
+            self.stats_store.cooldown_model(model_id, _TIMEOUT_COOLDOWN)
         elif kind == ErrorKind.HTTP_ERROR:
             self.limiter.cooldown(model_id, _HTTP_ERROR_COOLDOWN)
             self.stats_store.cooldown_model(model_id, _HTTP_ERROR_COOLDOWN)
@@ -241,3 +352,87 @@ def _capabilities_satisfy(required: ModelCapabilities, provided: ModelCapabiliti
     if required.reasoning and not provided.reasoning:
         return False
     return True
+
+
+class TrackedLLM:
+    """Wrapper around a ChatNVIDIA instance that auto-records success/failure.
+
+    Use ``ainvoke()`` exactly like the underlying LLM — latency and errors
+    are automatically reported back to the router's stats store.
+    """
+
+    def __init__(
+        self,
+        llm: Any,
+        router: NimRouter,
+        model_id: str,
+        *,
+        structured: bool = False,
+        tools: bool = False,
+        vision: bool = False,
+    ) -> None:
+        self._llm = llm
+        self._router = router
+        self._model_id = model_id
+        self._structured = structured
+        self._tools = tools
+        self._vision = vision
+
+    @property
+    def llm(self) -> Any:
+        """Access the underlying ChatNVIDIA instance."""
+        return self._llm
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    def invoke(self, messages: Any, **kwargs: Any) -> Any:
+        """Synchronous invoke with auto-tracking."""
+        t0 = time.monotonic()
+        try:
+            result = self._llm.invoke(messages, **kwargs)
+            self._router.record_success(
+                self._model_id,
+                latency=time.monotonic() - t0,
+                structured=self._structured,
+                tools=self._tools,
+                vision=self._vision,
+            )
+            return result
+        except Exception as exc:
+            self._router.record_failure(
+                self._model_id,
+                error=exc,
+                structured=self._structured,
+                tools=self._tools,
+                vision=self._vision,
+            )
+            raise
+
+    async def ainvoke(self, messages: Any, **kwargs: Any) -> Any:
+        """Async invoke with auto-tracking."""
+        t0 = time.monotonic()
+        try:
+            result = await self._llm.ainvoke(messages, **kwargs)
+            self._router.record_success(
+                self._model_id,
+                latency=time.monotonic() - t0,
+                structured=self._structured,
+                tools=self._tools,
+                vision=self._vision,
+            )
+            return result
+        except Exception as exc:
+            self._router.record_failure(
+                self._model_id,
+                error=exc,
+                structured=self._structured,
+                tools=self._tools,
+                vision=self._vision,
+            )
+            raise
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to the underlying LLM."""
+        return getattr(self._llm, name)

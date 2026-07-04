@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from nim_router.config import RouterConfig
 from nim_router.limiter import RateLimiter
 from nim_router.schemas import ModelCapabilities, ModelInfo
@@ -185,3 +187,56 @@ def test_new_model_gets_neutral_defaults():
     assert len(scored) == 1
     score = scored[0][1]
     assert 0.4 <= score <= 0.6
+
+
+def test_capability_penalty_structured():
+    """Model with bad structured success rate loses when structured is required."""
+    models = [
+        _make_model("good", tools=True, structured=True, quality_hint=0.5),
+        _make_model("bad", tools=True, structured=True, quality_hint=0.5),
+    ]
+    stats = StatsStore()
+    # "good" has 100% structured success
+    for _ in range(5):
+        stats.record_success("good", latency=1.0, tokens_per_second=30.0, structured=True)
+    # "bad" has 0% structured success
+    for _ in range(5):
+        stats.record_failure("bad", structured=True)
+
+    required = ModelCapabilities(structured=True)
+    scored = score_models(models, stats, priority="balanced", required=required)
+    assert scored[0][0].id == "good"
+
+
+def test_capability_penalty_tools():
+    """Model with bad tool success rate loses when tools are required."""
+    models = [
+        _make_model("good", tools=True, quality_hint=0.5),
+        _make_model("bad", tools=True, quality_hint=0.5),
+    ]
+    stats = StatsStore()
+    for _ in range(5):
+        stats.record_success("good", latency=1.0, tokens_per_second=30.0, tools=True)
+    for _ in range(5):
+        stats.record_failure("bad", tools=True)
+
+    required = ModelCapabilities(tools=True)
+    scored = score_models(models, stats, priority="balanced", required=required)
+    assert scored[0][0].id == "good"
+
+
+def test_no_penalty_without_required():
+    """Without required caps, capability-specific stats don't affect scoring."""
+    models = [
+        _make_model("a", tools=True, structured=True, quality_hint=0.5),
+        _make_model("b", tools=True, structured=True, quality_hint=0.5),
+    ]
+    stats = StatsStore()
+    # Both have identical latency and tps, same overall success
+    # but "a" has bad structured success rate
+    stats.record_success("a", latency=1.0, tokens_per_second=30.0, structured=False)
+    stats.record_success("b", latency=1.0, tokens_per_second=30.0, structured=True)
+
+    scored = score_models(models, stats, priority="balanced")
+    # Without required=, structured stats are ignored; identical models → tied scores
+    assert scored[0][1] == pytest.approx(scored[1][1], abs=1e-6)

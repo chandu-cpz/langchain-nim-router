@@ -13,6 +13,83 @@ logger = logging.getLogger(__name__)
 # Lazy import to keep import time fast
 _chat_nvidia_cls: Any = None
 
+# Built-in profiles for well-known NIM models.
+# quality: 0-1 hint used by scoring when no runtime history exists.
+# speed_hint: informational only (scoring derives speed from real latency).
+# Env overrides (NIM_ROUTER_QUALITY_HINTS_JSON) always win over these.
+DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
+    "openai/gpt-oss-120b": {
+        "quality": 0.90,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": True,
+    },
+    "meta/llama-3.3-70b-instruct": {
+        "quality": 0.85,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+    "meta/llama-3.1-70b-instruct": {
+        "quality": 0.82,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+    "meta/llama-3.1-8b-instruct": {
+        "quality": 0.70,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+    "nvidia/llama-3.1-nemotron-70b-instruct": {
+        "quality": 0.88,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+    "nvidia/nemotron-3-nano-30b-a3b": {
+        "quality": 0.78,
+        "tools": False,
+        "structured": True,
+        "vision": False,
+        "reasoning": True,
+    },
+    "meta/llama-3.2-11b-vision-instruct": {
+        "quality": 0.72,
+        "tools": False,
+        "structured": False,
+        "vision": True,
+        "reasoning": False,
+    },
+    "meta/llama-3.2-90b-vision-instruct": {
+        "quality": 0.82,
+        "tools": False,
+        "structured": False,
+        "vision": True,
+        "reasoning": False,
+    },
+    "mistralai/mistral-large-2-instruct": {
+        "quality": 0.87,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+    "google/gemma-2-27b-it": {
+        "quality": 0.78,
+        "tools": True,
+        "structured": True,
+        "vision": False,
+        "reasoning": False,
+    },
+}
+
 
 def _get_chat_nvidia_cls() -> Any:
     global _chat_nvidia_cls  # noqa: PLW0603
@@ -79,8 +156,11 @@ class ModelRegistry:
             cap_overrides = self.config.capabilities_overrides.get(model_id, {})
             capabilities = infer_capabilities(raw, cap_overrides)
 
-            # Quality hint
-            quality_hint = self.config.quality_hints.get(model_id, 0.5)
+            # Quality hint: env override > built-in profile > neutral default
+            profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
+            quality_hint = self.config.quality_hints.get(
+                model_id, profile.get("quality", 0.5)
+            )
 
             info = ModelInfo(
                 id=model_id,
@@ -110,7 +190,10 @@ class ModelRegistry:
             if any(m.id == model_id for m in models):
                 continue
             capabilities = infer_capabilities({}, overrides)
-            quality_hint = self.config.quality_hints.get(model_id, 0.5)
+            profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
+            quality_hint = self.config.quality_hints.get(
+                model_id, profile.get("quality", 0.5)
+            )
             models.append(
                 ModelInfo(
                     id=model_id,

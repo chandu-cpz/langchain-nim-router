@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -236,9 +236,136 @@ class TestBanAndCooldown:
         assert "model-a" in result
 
 
+class TestTimeoutCooldown:
+    def test_timeout_causes_cooldown(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        router_with_mock.record_failure("meta/llama-3.3-70b-instruct", kind="timeout")
+        assert router_with_mock.stats_store.is_cooling_down("meta/llama-3.3-70b-instruct")
+        assert not router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
+
+    @pytest.mark.asyncio
+    async def test_timeout_excludes_model_from_pick(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        first = await router_with_mock.pick(tools=True)
+        router_with_mock.record_failure(first.id, kind="timeout")
+
+        second = await router_with_mock.pick(tools=True)
+        assert second.id != first.id
+
+
+class TestGetRaw:
+    @pytest.mark.asyncio
+    async def test_get_raw_returns_bare_llm(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+            result = await router_with_mock.get_raw(tools=True)
+            assert result is mock_llm
+
+
+class TestAinvoke:
+    @pytest.mark.asyncio
+    async def test_ainvoke_auto_records_success(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_result = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
+            mock_create.return_value = mock_llm
+
+            result = await router_with_mock.ainvoke(
+                [{"role": "user", "content": "hi"}], tools=True
+            )
+            assert result is mock_result
+            # Stats should have been recorded
+            model_id = mock_create.call_args[1]["model_id"]
+            stats = router_with_mock.stats_store.get_stats(model_id)
+            assert stats.calls >= 1
+            assert stats.successes >= 1
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_auto_records_failure(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_llm.ainvoke = AsyncMock(
+                side_effect=Exception("rate limit exceeded")
+            )
+            mock_create.return_value = mock_llm
+
+            with pytest.raises(Exception, match="rate limit"):
+                await router_with_mock.ainvoke(
+                    [{"role": "user", "content": "hi"}], tools=True
+                )
+            model_id = mock_create.call_args[1]["model_id"]
+            stats = router_with_mock.stats_store.get_stats(model_id)
+            assert stats.failures >= 1
+            # Should also have triggered a cooldown
+            assert router_with_mock.stats_store.is_cooling_down(model_id)
+
+
+class TestTrackedLLM:
+    @pytest.mark.asyncio
+    async def test_tracked_ainvoke_records_success(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_result = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get(tools=True)
+            result = await tracked.ainvoke([{"role": "user", "content": "hi"}])
+            assert result is mock_result
+            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
+            assert stats.successes >= 1
+
+    @pytest.mark.asyncio
+    async def test_tracked_ainvoke_records_failure(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_llm.ainvoke = AsyncMock(side_effect=Exception("429"))
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get(tools=True)
+            with pytest.raises(Exception, match="429"):
+                await tracked.ainvoke([{"role": "user", "content": "hi"}])
+            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
+            assert stats.failures >= 1
+
+    @pytest.mark.asyncio
+    async def test_tracked_delegates_attributes(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_llm.custom_attr = "hello"
+            mock_create.return_value = mock_llm
+
+            tracked = await router_with_mock.get(tools=True)
+            assert tracked.custom_attr == "hello"
+
+
 class TestGet:
     @pytest.mark.asyncio
-    async def test_get_returns_mocked(self, router_with_mock):
+    async def test_get_returns_tracked(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
 
@@ -248,7 +375,10 @@ class TestGet:
             result = await router_with_mock.get(
                 tools=True, temperature=0.7, top_p=0.9, max_completion_tokens=1024
             )
-            assert result is mock_llm
+            # get() now returns TrackedLLM wrapping the raw LLM
+            from nim_router.router import TrackedLLM
+            assert isinstance(result, TrackedLLM)
+            assert result.llm is mock_llm
             call_args = mock_create.call_args
             assert call_args[1]["model_id"] is not None
             assert call_args[1]["temperature"] == 0.7
