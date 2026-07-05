@@ -163,6 +163,7 @@ class NimRouter:
             top_p=top_p,
             max_completion_tokens=max_completion_tokens,
             timeout=self.config.timeout_seconds,
+            patch_timeout=self.config.patch_timeout,
             model_kwargs=model_kwargs,
         )
 
@@ -202,6 +203,7 @@ class NimRouter:
             top_p=top_p,
             max_completion_tokens=max_completion_tokens,
             timeout=self.config.timeout_seconds,
+            patch_timeout=self.config.patch_timeout,
             model_kwargs=model_kwargs,
         )
         callback = self.tracker_for(
@@ -275,6 +277,7 @@ class NimRouter:
             top_p=top_p,
             max_completion_tokens=max_completion_tokens,
             timeout=self.config.timeout_seconds,
+            patch_timeout=self.config.patch_timeout,
             model_kwargs=model_kwargs,
         )
         callback = TrackingCallback(

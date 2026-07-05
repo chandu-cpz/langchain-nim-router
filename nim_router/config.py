@@ -17,6 +17,7 @@ class RouterConfig(BaseModel):
     timeout_seconds: float = 120.0
     stats_path: str | None = None
     allow_undiscovered_models: bool = False
+    patch_timeout: bool = True
 
     @classmethod
     def from_env(cls) -> RouterConfig:
@@ -30,9 +31,8 @@ class RouterConfig(BaseModel):
             quality_hints=_parse_json("NIM_ROUTER_QUALITY_HINTS_JSON", {}),
             timeout_seconds=_parse_float("NIM_ROUTER_TIMEOUT_SECONDS", 120.0),
             stats_path=os.environ.get("NIM_ROUTER_STATS_PATH"),
-            allow_undiscovered_models=bool(
-                os.environ.get("NIM_ROUTER_ALLOW_UNDISCOVERED", "")
-            ),
+            allow_undiscovered_models=_parse_bool("NIM_ROUTER_ALLOW_UNDISCOVERED", False),
+            patch_timeout=_parse_bool("NIM_ROUTER_PATCH_TIMEOUT", True),
         )
 
 
@@ -71,3 +71,15 @@ def _parse_json(env_var: str, default: Any) -> Any:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return default
+
+
+def _parse_bool(env_var: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable.
+
+    Accepts "1", "true", "yes", "on" (case-insensitive) as True.
+    Any other value (including "0", "false", "no", "off", "") is False.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}

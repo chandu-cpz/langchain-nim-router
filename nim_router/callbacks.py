@@ -56,8 +56,6 @@ class TrackingCallback(BaseCallbackHandler):
         self._mark_request_on_start = mark_request_on_start
         # run_id → monotonic start time
         self._starts: dict[UUID, float] = {}
-        # track which run_ids have had rate-limit marked (for cleanup on error)
-        self._marked_runs: set[UUID] = set()
 
     @property
     def model_id(self) -> str:
@@ -139,7 +137,6 @@ class TrackingCallback(BaseCallbackHandler):
         if run_id is None:
             return
         self._starts.pop(run_id, None)
-        self._marked_runs.discard(run_id)
 
         try:
             self._router.record_failure(

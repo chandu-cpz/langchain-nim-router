@@ -1,6 +1,6 @@
 """Optional middleware helper for LangChain agent integration.
 
-This module provides a convenience function for wiring the router into
+This module provides convenience functions for wiring the router into
 LangChain agent frameworks that support model-call middleware / hooks.
 
 Usage::
@@ -104,5 +104,61 @@ def create_nim_model_middleware(
             "passing request unchanged to handler."
         )
         return await handler(request)
+
+    return _middleware
+
+
+def create_nim_model_middleware_lc(
+    router: Any,
+    *,
+    tools: bool = False,
+    structured: bool = False,
+    vision: bool = False,
+    reasoning: bool = False,
+    priority: str = "balanced",
+) -> Callable[..., Awaitable[Any]]:
+    """Return a LangChain-native middleware using ``@wrap_model_call``.
+
+    This uses LangChain's official ``wrap_model_call`` decorator (available
+    in ``langchain.agents.middleware``) which properly integrates with
+    LangChain's model-calling infrastructure including structured output
+    bindings.
+
+    Usage::
+
+        from nim_router.middleware import create_nim_model_middleware_lc
+
+        middleware = create_nim_model_middleware_lc(
+            router,
+            tools=True,
+            structured=True,
+            priority="fast",
+        )
+
+        # Pass to LangGraph/LangChain agent that supports model middleware
+        # e.g., create_react_agent(..., model=..., model_call_middleware=middleware)
+
+    Requires ``langchain`` package (not just ``langchain-core``).
+    """
+    try:
+        from langchain.agents.middleware import wrap_model_call
+    except ImportError as e:
+        raise ImportError(
+            "create_nim_model_middleware_lc requires the 'langchain' package. "
+            "Install with: pip install langchain"
+        ) from e
+
+    @wrap_model_call
+    async def _middleware(request: Any, handler: Callable[..., Awaitable[Any]]) -> Any:
+        # router.select returns ModelSelection with llm and callback
+        selection = await router.select(
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            priority=priority,
+        )
+        # Use request.override(model=...) which is the official pattern
+        return await handler(request.override(model=selection.llm))
 
     return _middleware

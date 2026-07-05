@@ -38,7 +38,10 @@ class StatsStore:
         try:
             self._stats_path.parent.mkdir(parents=True, exist_ok=True)
             data = {k: v.model_dump() for k, v in self._stats.items()}
-            self._stats_path.write_text(json.dumps(data, indent=2))
+            # Atomic write: write to temp file then rename
+            tmp_path = self._stats_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2))
+            tmp_path.replace(self._stats_path)
         except Exception:
             logger.warning("Failed to save stats to %s", self._stats_path)
 
