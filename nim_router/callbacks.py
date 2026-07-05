@@ -22,6 +22,17 @@ class TrackingCallback(BaseCallbackHandler):
 
     Instances are created via :meth:`NimRouter.tracker_for` or
     :meth:`NimRouter.select` — not constructed directly.
+
+    .. note::
+
+       ``structured_success_rate`` / ``tool_success_rate`` /
+       ``vision_success_rate`` record whether the **LLM call** succeeded
+       while selected for that capability — not whether downstream schema
+       parsing or tool execution succeeded.  A structured success means
+       the API returned without error; a ``ValidationError`` in
+       ``with_structured_output`` is *not* captured here.  Use explicit
+       app-level ``record_failure(kind="structured_output_failure")`` for
+       parser/tool correctness tracking.
     """
 
     def __init__(
@@ -33,6 +44,7 @@ class TrackingCallback(BaseCallbackHandler):
         structured: bool = False,
         vision: bool = False,
         reasoning: bool = False,
+        mark_request_on_start: bool = True,
     ) -> None:
         super().__init__()
         self._router = router
@@ -41,9 +53,10 @@ class TrackingCallback(BaseCallbackHandler):
         self._structured = structured
         self._vision = vision
         self._reasoning = reasoning
+        self._mark_request_on_start = mark_request_on_start
         # run_id → monotonic start time
         self._starts: dict[UUID, float] = {}
-        # track which run_ids have already been rate-limited counted
+        # track which run_ids have had rate-limit marked (for cleanup on error)
         self._marked_runs: set[UUID] = set()
 
     @property
@@ -78,11 +91,11 @@ class TrackingCallback(BaseCallbackHandler):
         if run_id is None or run_id in self._starts:
             return
         self._starts[run_id] = time.monotonic()
-        try:
-            self._router.limiter.mark_request(self._model_id)
-            self._marked_runs.add(run_id)
-        except Exception:
-            logger.debug("Failed to mark rate-limit request", exc_info=True)
+        if self._mark_request_on_start:
+            try:
+                self._router.limiter.mark_request(self._model_id)
+            except Exception:
+                logger.debug("Failed to mark rate-limit request", exc_info=True)
 
     # ── end hook ─────────────────────────────────────────────────────
 
@@ -96,7 +109,6 @@ class TrackingCallback(BaseCallbackHandler):
         if run_id is None:
             return
         start = self._starts.pop(run_id, None)
-        self._marked_runs.discard(run_id)
         if start is None:
             return
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import logging
 from typing import Any, Literal
 
@@ -72,6 +71,28 @@ class NimRouter:
         """Select the best model and return its metadata.
 
         Pure selection — no rate-limit reservation, no LLM creation.
+        Use :meth:`select` or :meth:`ainvoke` for tracked invocations.
+        """
+        return await self._pick(
+            tools=tools, structured=structured, vision=vision,
+            reasoning=reasoning, priority=priority, reserve=False,
+        )
+
+    async def _pick(
+        self,
+        *,
+        tools: bool,
+        structured: bool,
+        vision: bool,
+        reasoning: bool,
+        priority: Literal["fast", "quality", "balanced"],
+        reserve: bool,
+    ) -> ModelInfo:
+        """Internal pick with optional atomic rate-limit reservation.
+
+        When *reserve* is True the winning model's RPM slot is marked
+        inside the pick lock so concurrent ``ainvoke()`` calls cannot
+        all select the same model before any callback fires.
         """
         async with self._pick_lock:
             models = await self.registry.ensure_loaded()
@@ -100,7 +121,12 @@ class NimRouter:
             scored = score_models(
                 candidates, self.stats_store, priority, required=required
             )
-            return scored[0][0]
+            best = scored[0][0]
+
+            if reserve:
+                self.limiter.mark_request(best.id)
+
+            return best
 
     async def get(
         self,
@@ -229,36 +255,36 @@ class NimRouter:
     ) -> Any:
         """One-shot: select, invoke, and auto-track.
 
-        * Selects the best model via :meth:`select`.
-        * Merges caller config with the tracking callback and metadata.
-        * Invokes the LLM.  Stats recording is handled entirely by the
-          callback — ``ainvoke`` does **not** manually record
-          success/failure.
-        * On failure, ``record_failure`` (called by the callback) applies
-          cooldown/ban automatically.
+        * Reserves a rate-limit slot atomically inside the pick lock so
+          concurrent ``ainvoke()`` calls distribute across models.
+        * Creates a callback that does NOT re-mark the request on start
+          (the slot is already reserved).
+        * Merges caller config with the callback, tags, and metadata.
+        * Invokes the LLM.  Stats recording is handled by the callback.
         """
-        selection = await self.select(
-            tools=tools,
-            structured=structured,
-            vision=vision,
-            reasoning=reasoning,
-            priority=priority,
-            max_completion_tokens=max_completion_tokens,
+        required = ModelCapabilities(
+            tools=tools, structured=structured, vision=vision, reasoning=reasoning,
+        )
+        info = await self._pick(
+            tools=tools, structured=structured, vision=vision,
+            reasoning=reasoning, priority=priority, reserve=True,
+        )
+        llm = create_chat_nvidia(
+            model_id=info.id,
             temperature=temperature,
             top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            timeout=self.config.timeout_seconds,
             model_kwargs=model_kwargs,
         )
-        merged = _merge_config_with_callback(
-            config, selection.callback, selection.info,
-            ModelCapabilities(
-                tools=tools,
-                structured=structured,
-                vision=vision,
-                reasoning=reasoning,
-            ),
-            priority,
+        callback = TrackingCallback(
+            self, info.id,
+            tools=tools, structured=structured,
+            vision=vision, reasoning=reasoning,
+            mark_request_on_start=False,
         )
-        return await selection.llm.ainvoke(messages, config=merged)
+        merged = _merge_config_with_callback(config, callback, info, required, priority)
+        return await llm.ainvoke(messages, config=merged)
 
     # ── Manual recording ─────────────────────────────────────────────
 
@@ -412,21 +438,20 @@ def _merge_config_with_callback(
     priority: str,
 ) -> dict[str, Any]:
     """Build a LangChain RunnableConfig dict that includes the tracking
-    callback, tags, and metadata — without mutating the caller's config."""
-    merged: dict[str, Any] = {}
+    callback, tags, and metadata — without mutating the caller's config.
 
-    # Deep-copy caller config to avoid mutation
-    if config:
-        merged = copy.deepcopy(config)
+    Uses shallow copy so callback objects, locks, and clients are not
+    cloned (deepcopy can break those).
+    """
+    merged: dict[str, Any] = dict(config) if config else {}
 
     # ── callbacks ────────────────────────────────────────────────────
     existing = merged.get("callbacks")
     if existing is None:
         merged["callbacks"] = [callback]
     elif isinstance(existing, list):
-        merged["callbacks"] = existing + [callback]
+        merged["callbacks"] = list(existing) + [callback]
     else:
-        # Single callback object (not a list)
         merged["callbacks"] = [existing, callback]
 
     # ── tags ─────────────────────────────────────────────────────────
@@ -446,7 +471,7 @@ def _merge_config_with_callback(
 
     existing_tags = merged.get("tags")
     if isinstance(existing_tags, list):
-        merged["tags"] = existing_tags + tags
+        merged["tags"] = list(existing_tags) + tags
     else:
         merged["tags"] = tags
 
