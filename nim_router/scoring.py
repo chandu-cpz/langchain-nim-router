@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from nim_router.capabilities import capabilities_satisfy
 from nim_router.limiter import RateLimiter
 from nim_router.schemas import ModelCapabilities, ModelInfo, ModelRuntimeStats
 from nim_router.stats import StatsStore
@@ -31,23 +32,11 @@ def filter_candidates(
             continue
 
         # Check capabilities
-        if not _capabilities_satisfy(required, model.capabilities):
+        if not capabilities_satisfy(required, model.capabilities):
             continue
 
         result.append(model)
     return result
-
-
-def _capabilities_satisfy(required: ModelCapabilities, provided: ModelCapabilities) -> bool:
-    if required.tools and not provided.tools:
-        return False
-    if required.structured and not provided.structured:
-        return False
-    if required.vision and not provided.vision:
-        return False
-    if required.reasoning and not provided.reasoning:
-        return False
-    return True
 
 
 def score_models(

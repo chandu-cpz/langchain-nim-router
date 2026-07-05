@@ -5,6 +5,7 @@ import logging
 from typing import Any, Literal
 
 from nim_router.callbacks import TrackingCallback
+from nim_router.capabilities import capabilities_satisfy as _capabilities_satisfy
 from nim_router.client import create_chat_nvidia
 from nim_router.config import RouterConfig
 from nim_router.errors import ErrorKind, NoUsableModelError, classify_error
@@ -419,18 +420,6 @@ class NimRouter:
             if excluded:
                 reasons[model.id] = excluded
         return reasons
-
-
-def _capabilities_satisfy(required: ModelCapabilities, provided: ModelCapabilities) -> bool:
-    if required.tools and not provided.tools:
-        return False
-    if required.structured and not provided.structured:
-        return False
-    if required.vision and not provided.vision:
-        return False
-    if required.reasoning and not provided.reasoning:
-        return False
-    return True
 
 
 def _merge_config_with_callback(

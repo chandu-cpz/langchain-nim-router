@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import threading
 import time
+from collections import defaultdict
 
 from nim_router.config import RouterConfig
 from nim_router.schemas import RateLimitState
@@ -12,6 +14,7 @@ class RateLimiter:
     def __init__(self, config: RouterConfig) -> None:
         self._config = config
         self._states: dict[str, RateLimitState] = {}
+        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
     def _get_state(self, model_id: str) -> RateLimitState:
         if model_id not in self._states:
@@ -41,9 +44,15 @@ class RateLimiter:
         return True
 
     def mark_request(self, model_id: str) -> None:
-        """Record a request timestamp for the model."""
-        state = self._get_state(model_id)
-        state.recent_request_timestamps.append(time.monotonic())
+        """Record a request timestamp for the model (thread-safe)."""
+        with self._locks[model_id]:
+            state = self._get_state(model_id)
+            now = time.monotonic()
+            # Clean old timestamps first
+            state.recent_request_timestamps = [
+                ts for ts in state.recent_request_timestamps if now - ts < 60.0
+            ]
+            state.recent_request_timestamps.append(now)
 
     def mark_rate_limited(self, model_id: str) -> None:
         """Record that a model returned a rate-limit error."""
@@ -53,7 +62,10 @@ class RateLimiter:
     def cooldown(self, model_id: str, seconds: float) -> None:
         """Set a cooldown period for the model."""
         state = self._get_state(model_id)
-        state.cooldown_until = time.monotonic() + seconds
+        new_cooldown = time.monotonic() + seconds
+        # Only extend cooldown, never shorten an existing one
+        if state.cooldown_until is None or state.cooldown_until < new_cooldown:
+            state.cooldown_until = new_cooldown
 
     def clear_cooldown(self, model_id: str) -> None:
         """Clear cooldown for a model."""

@@ -120,7 +120,10 @@ class StatsStore:
 
     def cooldown_model(self, model_id: str, seconds: float) -> None:
         stats = self._get(model_id)
-        stats.cooldown_until = time.time() + seconds
+        new_cooldown = time.time() + seconds
+        # Only extend cooldown, never shorten an existing one
+        if stats.cooldown_until is None or stats.cooldown_until < new_cooldown:
+            stats.cooldown_until = new_cooldown
         self._save()
 
     def get_stats(self, model_id: str) -> ModelRuntimeStats:

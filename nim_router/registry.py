@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -148,16 +149,21 @@ class ModelRegistry:
         self.config = config
         self._models: list[ModelInfo] = []
         self._loaded = False
+        self._load_lock = asyncio.Lock()
 
     @property
     def models(self) -> list[ModelInfo]:
         return self._models
 
     async def ensure_loaded(self) -> list[ModelInfo]:
-        """Ensure model discovery has been performed."""
-        if not self._loaded:
+        """Ensure model discovery has been performed (thread-safe)."""
+        if self._loaded:
+            return self._models
+        async with self._load_lock:
+            if self._loaded:
+                return self._models
             await self.discover()
-        return self._models
+            return self._models
 
     async def discover(self) -> list[ModelInfo]:
         """Discover available models from NVIDIA API."""

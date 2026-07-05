@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,11 @@ class ModelInfo(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
 
 
+if TYPE_CHECKING:
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from nim_router.callbacks import TrackingCallback
+
+
 @dataclass
 class ModelSelection:
     """Bundles the chosen model metadata, a real ChatNVIDIA LLM, and a
@@ -31,8 +36,8 @@ class ModelSelection:
     """
 
     info: ModelInfo
-    llm: Any
-    callback: Any  # TrackingCallback — use Any to avoid circular import
+    llm: "BaseChatModel"
+    callback: "TrackingCallback"
 
 
 class RateLimitState(BaseModel):

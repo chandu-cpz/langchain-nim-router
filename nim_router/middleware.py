@@ -159,6 +159,12 @@ def create_nim_model_middleware_lc(
             priority=priority,
         )
         # Use request.override(model=...) which is the official pattern
-        return await handler(request.override(model=selection.llm))
+        # Also inject the tracking callback via config
+        overridden = request.override(model=selection.llm)
+        if hasattr(overridden, "config") and isinstance(overridden.config, dict):
+            callbacks = overridden.config.get("callbacks", [])
+            callbacks.append(selection.callback)
+            overridden.config["callbacks"] = callbacks
+        return await handler(overridden)
 
     return _middleware
