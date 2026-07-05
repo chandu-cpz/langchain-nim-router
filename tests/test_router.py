@@ -6,10 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from nim_router.callbacks import TrackingCallback
 from nim_router.config import RouterConfig
 from nim_router.errors import NoUsableModelError
-from nim_router.router import NimRouter
-from nim_router.schemas import ModelInfo
+from nim_router.router import NimRouter, _merge_config_with_callback
+from nim_router.schemas import ModelCapabilities, ModelInfo, ModelSelection
 
 
 @pytest.fixture
@@ -35,10 +36,12 @@ def _make_fake_models():
     return FAKE_MODELS
 
 
+# ── pick ─────────────────────────────────────────────────────────────
+
+
 class TestPick:
     @pytest.mark.asyncio
     async def test_pick_tools_model(self, router_with_mock):
-
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
         result = await router_with_mock.pick(tools=True)
@@ -69,7 +72,6 @@ class TestPick:
     async def test_pick_excludes_banned(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
-        # Ban two tools-capable models, one remains
         router_with_mock.ban_model("meta/llama-3.3-70b-instruct")
         router_with_mock.ban_model("meta/llama-3.1-8b-instruct")
         result = await router_with_mock.pick(tools=True)
@@ -81,55 +83,308 @@ class TestPick:
         models = _build_model_infos()
         router_with_mock.registry._models = models
 
-        # Give 8b model fast stats, 70b model slow stats, nemotron neutral
         router_with_mock.record_success(
             "meta/llama-3.1-8b-instruct", latency=0.5, tokens_per_second=80.0
         )
         router_with_mock.record_success(
             "meta/llama-3.3-70b-instruct", latency=3.0, tokens_per_second=20.0
         )
-        # Give nemotron slow stats too so it doesn't win on neutral defaults
         router_with_mock.record_success(
             "nvidia/llama-3.1-nemotron-70b-instruct", latency=4.0, tokens_per_second=15.0
         )
 
         result = await router_with_mock.pick(tools=True, priority="fast")
-        # The faster model should be preferred
         assert result.id == "meta/llama-3.1-8b-instruct"
+
+
+# ── get ──────────────────────────────────────────────────────────────
+
+
+class TestGet:
+    @pytest.mark.asyncio
+    async def test_get_returns_raw(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+            result = await router_with_mock.get(
+                tools=True, temperature=0.7, top_p=0.9, max_completion_tokens=1024
+            )
+            assert result is mock_llm
+            call_args = mock_create.call_args
+            assert call_args[1]["model_id"] is not None
+            assert call_args[1]["temperature"] == 0.7
+            assert call_args[1]["top_p"] == 0.9
+            assert call_args[1]["max_completion_tokens"] == 1024
+
+
+# ── select ───────────────────────────────────────────────────────────
+
+
+class TestSelect:
+    @pytest.mark.asyncio
+    async def test_select_returns_model_selection(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+            sel = await router_with_mock.select(tools=True, structured=True)
+
+            assert isinstance(sel, ModelSelection)
+            assert sel.info.capabilities.tools is True
+            assert sel.llm is mock_llm
+            assert isinstance(sel.callback, TrackingCallback)
+            assert sel.callback.model_id == sel.info.id
+            assert sel.callback._tools is True
+            assert sel.callback._structured is True
+
+
+# ── tracker_for ──────────────────────────────────────────────────────
+
+
+class TestTrackerFor:
+    def test_tracker_for_string_id(self, router_with_mock):
+        cb = router_with_mock.tracker_for("model-a", tools=True)
+        assert isinstance(cb, TrackingCallback)
+        assert cb.model_id == "model-a"
+        assert cb._tools is True
+
+    def test_tracker_for_model_info(self, router_with_mock):
+        info = ModelInfo(id="model-b", capabilities=ModelCapabilities(vision=True))
+        cb = router_with_mock.tracker_for(info, vision=True, reasoning=True)
+        assert cb.model_id == "model-b"
+        assert cb._vision is True
+        assert cb._reasoning is True
+
+
+# ── TrackingCallback ─────────────────────────────────────────────────
+
+
+class TestTrackingCallback:
+    @pytest.mark.asyncio
+    async def test_callback_marks_limiter_on_start(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        cb = router_with_mock.tracker_for("model-a", tools=True)
+        from uuid import uuid4
+        run_id = uuid4()
+        cb.on_chat_model_start({}, [], run_id=run_id)
+
+        state = router_with_mock.limiter.get_state("model-a")
+        assert len(state.recent_request_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_callback_marks_limiter_once_per_run(self, router_with_mock):
+        cb = router_with_mock.tracker_for("model-a")
+        from uuid import uuid4
+        run_id = uuid4()
+        cb.on_chat_model_start({}, [], run_id=run_id)
+        cb.on_llm_start({}, [], run_id=run_id)
+
+        state = router_with_mock.limiter.get_state("model-a")
+        assert len(state.recent_request_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_callback_records_success_on_end(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        cb = router_with_mock.tracker_for("model-a", tools=True)
+        from uuid import uuid4
+        from langchain_core.outputs import LLMResult, Generation
+        run_id = uuid4()
+        cb.on_chat_model_start({}, [], run_id=run_id)
+
+        # Simulate LLMResult with token usage
+        llm_result = LLMResult(
+            generations=[[Generation(text="hi")]],
+            llm_output={"token_usage": {"completion_tokens": 50}},
+        )
+        cb.on_llm_end(llm_result, run_id=run_id)
+
+        stats = router_with_mock.stats_store.get_stats("model-a")
+        assert stats.successes >= 1
+        assert stats.avg_latency is not None
+        assert stats.avg_tokens_per_second is not None
+
+    @pytest.mark.asyncio
+    async def test_callback_records_failure_on_error(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        cb = router_with_mock.tracker_for("model-a")
+        from uuid import uuid4
+        run_id = uuid4()
+        cb.on_chat_model_start({}, [], run_id=run_id)
+        cb.on_llm_error(Exception("429 too many requests"), run_id=run_id)
+
+        stats = router_with_mock.stats_store.get_stats("model-a")
+        assert stats.failures >= 1
+        assert router_with_mock.stats_store.is_cooling_down("model-a")
+
+    @pytest.mark.asyncio
+    async def test_callback_bans_on_404(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        cb = router_with_mock.tracker_for("model-a")
+        from uuid import uuid4
+        run_id = uuid4()
+        cb.on_chat_model_start({}, [], run_id=run_id)
+        cb.on_llm_error(Exception("model not found"), run_id=run_id)
+
+        assert router_with_mock.stats_store.is_banned("model-a")
+
+
+# ── ainvoke ──────────────────────────────────────────────────────────
+
+
+class TestAinvoke:
+    @pytest.mark.asyncio
+    async def test_ainvoke_passes_callback_in_config(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_result = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
+            mock_create.return_value = mock_llm
+
+            result = await router_with_mock.ainvoke(
+                [{"role": "user", "content": "hi"}], tools=True
+            )
+            assert result is mock_result
+            # Check that ainvoke passed config with callbacks
+            call_kwargs = mock_llm.ainvoke.call_args
+            config = call_kwargs[1]["config"]
+            assert "callbacks" in config
+            assert any(isinstance(cb, TrackingCallback) for cb in config["callbacks"])
+            assert "tags" in config
+            assert any("nim-router" in t for t in config["tags"])
+            assert "metadata" in config
+            assert config["metadata"]["nim_router_tools"] is True
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_preserves_caller_callbacks(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_result = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
+            mock_create.return_value = mock_llm
+
+            caller_cb = MagicMock()
+            await router_with_mock.ainvoke(
+                [{"role": "user", "content": "hi"}],
+                tools=True,
+                config={"callbacks": [caller_cb]},
+            )
+            config = mock_llm.ainvoke.call_args[1]["config"]
+            cbs = config["callbacks"]
+            assert caller_cb in cbs
+            assert any(isinstance(cb, TrackingCallback) for cb in cbs)
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_does_not_mutate_caller_config(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=MagicMock())
+            mock_create.return_value = mock_llm
+
+            original_config = {"callbacks": [MagicMock()], "tags": ["user-tag"]}
+            await router_with_mock.ainvoke(
+                [{"role": "user", "content": "hi"}],
+                tools=True,
+                config=original_config,
+            )
+            # Original config should not be mutated
+            assert len(original_config["callbacks"]) == 1
+            assert original_config["tags"] == ["user-tag"]
+
+
+# ── config merge ─────────────────────────────────────────────────────
+
+
+class TestConfigMerge:
+    def test_merge_creates_callbacks(self):
+        cb = MagicMock()
+        info = ModelInfo(id="m1")
+        caps = ModelCapabilities(tools=True)
+        result = _merge_config_with_callback(None, cb, info, caps, "fast")
+        assert cb in result["callbacks"]
+        assert "nim-router" in result["tags"]
+        assert result["metadata"]["nim_router_model_id"] == "m1"
+
+    def test_merge_appends_to_existing_callbacks(self):
+        cb = MagicMock()
+        existing_cb = MagicMock()
+        info = ModelInfo(id="m1")
+        caps = ModelCapabilities()
+        result = _merge_config_with_callback(
+            {"callbacks": [existing_cb]}, cb, info, caps, "balanced"
+        )
+        assert existing_cb in result["callbacks"]
+        assert cb in result["callbacks"]
+
+    def test_merge_preserves_existing_tags(self):
+        cb = MagicMock()
+        info = ModelInfo(id="m1")
+        caps = ModelCapabilities()
+        result = _merge_config_with_callback(
+            {"tags": ["user-tag"]}, cb, info, caps, "balanced"
+        )
+        assert "user-tag" in result["tags"]
+        assert "nim-router" in result["tags"]
+
+    def test_merge_preserves_existing_metadata(self):
+        cb = MagicMock()
+        info = ModelInfo(id="m1")
+        caps = ModelCapabilities()
+        result = _merge_config_with_callback(
+            {"metadata": {"key": "val"}}, cb, info, caps, "balanced"
+        )
+        assert result["metadata"]["key"] == "val"
+        assert result["metadata"]["nim_router_model_id"] == "m1"
+
+
+# ── record failure / cooldown / ban ─────────────────────────────────
 
 
 class TestRecordFailure:
     def test_rate_limit_cools_down(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
-
         error = Exception("rate limit exceeded")
         router_with_mock.record_failure("meta/llama-3.3-70b-instruct", error=error)
-
-        # Model should be cooling down
         assert router_with_mock.stats_store.is_cooling_down("meta/llama-3.3-70b-instruct")
 
     def test_404_bans_model(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
-
         error = Exception("model not found")
         router_with_mock.record_failure("meta/llama-3.3-70b-instruct", error=error)
-
         assert router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
 
     def test_rate_limit_does_not_ban(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
-
         error = Exception("429 too many requests")
         router_with_mock.record_failure("meta/llama-3.3-70b-instruct", error=error)
-
-        # Should cooldown, not ban
         assert not router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
         assert router_with_mock.stats_store.is_cooling_down("meta/llama-3.3-70b-instruct")
 
-    def test_429_bans_model(self, router_with_mock):
+    def test_429_with_status_code_cooldowns(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
 
@@ -138,8 +393,6 @@ class TestRecordFailure:
 
         error = FakeHTTPError("rate limit")
         router_with_mock.record_failure("meta/llama-3.3-70b-instruct", error=error)
-
-        # 429 with status_code should not ban
         assert not router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
 
 
@@ -149,26 +402,41 @@ class TestFailureFallback:
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
 
-        # First pick
         first = await router_with_mock.pick(tools=True)
         first_id = first.id
-
-        # Record 429 failure
         router_with_mock.record_failure(first_id, error=Exception("429 too many requests"))
 
-        # Next pick should exclude the rate-limited model
         second = await router_with_mock.pick(tools=True)
         assert second.id != first_id
+
+
+class TestTimeoutCooldown:
+    def test_timeout_causes_cooldown(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+        router_with_mock.record_failure("meta/llama-3.3-70b-instruct", kind="timeout")
+        assert router_with_mock.stats_store.is_cooling_down("meta/llama-3.3-70b-instruct")
+        assert not router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
+
+    @pytest.mark.asyncio
+    async def test_timeout_excludes_model_from_pick(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        first = await router_with_mock.pick(tools=True)
+        router_with_mock.record_failure(first.id, kind="timeout")
+
+        second = await router_with_mock.pick(tools=True)
+        assert second.id != first.id
+
+
+# ── record success ───────────────────────────────────────────────────
 
 
 class TestRecordSuccess:
     def test_record_success_updates_stats(self, router_with_mock):
         router_with_mock.record_success(
-            "model-a",
-            latency=1.5,
-            tokens_per_second=45.0,
-            structured=True,
-            tools=True,
+            "model-a", latency=1.5, tokens_per_second=45.0, structured=True, tools=True,
         )
         stats = router_with_mock.stats_store.get_stats("model-a")
         assert stats.calls == 1
@@ -177,6 +445,27 @@ class TestRecordSuccess:
         assert stats.tool_successes == 1
         assert stats.avg_latency is not None
         assert stats.avg_tokens_per_second is not None
+
+
+# ── ban / cooldown / stats ───────────────────────────────────────────
+
+
+class TestBanAndCooldown:
+    def test_ban_model(self, router_with_mock):
+        router_with_mock.ban_model("model-a")
+        assert router_with_mock.stats_store.is_banned("model-a")
+
+    def test_cooldown_model(self, router_with_mock):
+        router_with_mock.cooldown_model("model-a", 30.0)
+        assert router_with_mock.stats_store.is_cooling_down("model-a")
+
+    def test_stats(self, router_with_mock):
+        router_with_mock.record_success("model-a")
+        result = router_with_mock.stats()
+        assert "model-a" in result
+
+
+# ── convenience helpers ─────────────────────────────────────────────
 
 
 class TestConvenienceHelpers:
@@ -221,239 +510,7 @@ class TestConvenienceHelpers:
             mock_create.assert_called_once()
 
 
-class TestBanAndCooldown:
-    def test_ban_model(self, router_with_mock):
-        router_with_mock.ban_model("model-a")
-        assert router_with_mock.stats_store.is_banned("model-a")
-
-    def test_cooldown_model(self, router_with_mock):
-        router_with_mock.cooldown_model("model-a", 30.0)
-        assert router_with_mock.stats_store.is_cooling_down("model-a")
-
-    def test_stats(self, router_with_mock):
-        router_with_mock.record_success("model-a")
-        result = router_with_mock.stats()
-        assert "model-a" in result
-
-
-class TestTimeoutCooldown:
-    def test_timeout_causes_cooldown(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        router_with_mock.record_failure("meta/llama-3.3-70b-instruct", kind="timeout")
-        assert router_with_mock.stats_store.is_cooling_down("meta/llama-3.3-70b-instruct")
-        assert not router_with_mock.stats_store.is_banned("meta/llama-3.3-70b-instruct")
-
-    @pytest.mark.asyncio
-    async def test_timeout_excludes_model_from_pick(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        first = await router_with_mock.pick(tools=True)
-        router_with_mock.record_failure(first.id, kind="timeout")
-
-        second = await router_with_mock.pick(tools=True)
-        assert second.id != first.id
-
-
-class TestGetRaw:
-    @pytest.mark.asyncio
-    async def test_get_returns_bare_llm(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-            result = await router_with_mock.get(tools=True)
-            assert result is mock_llm
-
-
-class TestAinvoke:
-    @pytest.mark.asyncio
-    async def test_ainvoke_auto_records_success(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_result = MagicMock()
-            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
-            mock_create.return_value = mock_llm
-
-            result = await router_with_mock.ainvoke(
-                [{"role": "user", "content": "hi"}], tools=True
-            )
-            assert result is mock_result
-            # Stats should have been recorded
-            model_id = mock_create.call_args[1]["model_id"]
-            stats = router_with_mock.stats_store.get_stats(model_id)
-            assert stats.calls >= 1
-            assert stats.successes >= 1
-
-    @pytest.mark.asyncio
-    async def test_ainvoke_auto_records_failure(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_llm.ainvoke = AsyncMock(
-                side_effect=Exception("rate limit exceeded")
-            )
-            mock_create.return_value = mock_llm
-
-            with pytest.raises(Exception, match="rate limit"):
-                await router_with_mock.ainvoke(
-                    [{"role": "user", "content": "hi"}], tools=True
-                )
-            model_id = mock_create.call_args[1]["model_id"]
-            stats = router_with_mock.stats_store.get_stats(model_id)
-            assert stats.failures >= 1
-            # Should also have triggered a cooldown
-            assert router_with_mock.stats_store.is_cooling_down(model_id)
-
-
-class TestTrackedLLM:
-    @pytest.mark.asyncio
-    async def test_tracked_ainvoke_records_success(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_result = MagicMock()
-            mock_llm.ainvoke = AsyncMock(return_value=mock_result)
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            result = await tracked.ainvoke([{"role": "user", "content": "hi"}])
-            assert result is mock_result
-            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
-            assert stats.successes >= 1
-
-    @pytest.mark.asyncio
-    async def test_tracked_ainvoke_records_failure(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_llm.ainvoke = AsyncMock(side_effect=Exception("429"))
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            with pytest.raises(Exception, match="429"):
-                await tracked.ainvoke([{"role": "user", "content": "hi"}])
-            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
-            assert stats.failures >= 1
-
-    @pytest.mark.asyncio
-    async def test_tracked_delegates_attributes(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_llm.custom_attr = "hello"
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            assert tracked.custom_attr == "hello"
-
-    @pytest.mark.asyncio
-    async def test_tracked_with_structured_output_wraps(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_structured = MagicMock()
-            mock_structured.ainvoke = AsyncMock(return_value="ok")
-            mock_llm.with_structured_output.return_value = mock_structured
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            result = tracked.with_structured_output({"type": "object"})
-            from nim_router.router import TrackedLLM
-            assert isinstance(result, TrackedLLM)
-            assert result._structured is True
-            # Invoke through the structured wrapper still tracks
-            await result.ainvoke("hi")
-            stats = router_with_mock.stats_store.get_stats(tracked.model_id)
-            assert stats.successes >= 1
-
-    @pytest.mark.asyncio
-    async def test_tracked_bind_tools_wraps(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_bound = MagicMock()
-            mock_bound.ainvoke = AsyncMock(return_value="ok")
-            mock_llm.bind_tools.return_value = mock_bound
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            result = tracked.bind_tools([{"type": "function"}])
-            from nim_router.router import TrackedLLM
-            assert isinstance(result, TrackedLLM)
-            assert result._tools is True
-
-    @pytest.mark.asyncio
-    async def test_tracked_invoke_marks_rate_limit(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_llm.invoke.return_value = "ok"
-            mock_create.return_value = mock_llm
-
-            tracked = await router_with_mock.get_tracked(tools=True)
-            # pick() should NOT have marked a request
-            state = router_with_mock.limiter.get_state(tracked.model_id)
-            assert len(state.recent_request_timestamps) == 0
-            # invoke() should mark a request
-            tracked.invoke("hi")
-            state = router_with_mock.limiter.get_state(tracked.model_id)
-            assert len(state.recent_request_timestamps) == 1
-
-
-class TestGet:
-    @pytest.mark.asyncio
-    async def test_get_returns_raw(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-            result = await router_with_mock.get(
-                tools=True, temperature=0.7, top_p=0.9, max_completion_tokens=1024
-            )
-            # get() returns bare ChatNVIDIA
-            assert result is mock_llm
-            call_args = mock_create.call_args
-            assert call_args[1]["model_id"] is not None
-            assert call_args[1]["temperature"] == 0.7
-            assert call_args[1]["top_p"] == 0.9
-            assert call_args[1]["max_completion_tokens"] == 1024
-
-    @pytest.mark.asyncio
-    async def test_get_tracked_returns_tracked(self, router_with_mock):
-        router_with_mock.registry._loaded = True
-        router_with_mock.registry._models = _build_model_infos()
-
-        with patch("nim_router.router.create_chat_nvidia") as mock_create:
-            mock_llm = MagicMock()
-            mock_create.return_value = mock_llm
-            result = await router_with_mock.get_tracked(tools=True)
-            from nim_router.router import TrackedLLM
-            assert isinstance(result, TrackedLLM)
-            assert result.llm is mock_llm
+# ── env config ───────────────────────────────────────────────────────
 
 
 class TestEnvConfig:
@@ -498,6 +555,9 @@ class TestEnvConfig:
             assert config.quality_hints["model-a"] == 0.95
 
 
+# ── allow_undiscovered ───────────────────────────────────────────────
+
+
 class TestAllowUndiscovered:
     @pytest.mark.asyncio
     async def test_override_only_model_not_added_by_default(self, mock_chat_nvidia_cls):
@@ -520,6 +580,9 @@ class TestAllowUndiscovered:
             r = NimRouter(config=config)
             await r.registry.ensure_loaded()
             assert any(m.id == "phantom/model" for m in r.registry.models)
+
+
+# ── helpers ──────────────────────────────────────────────────────────
 
 
 def _build_model_infos() -> list[ModelInfo]:

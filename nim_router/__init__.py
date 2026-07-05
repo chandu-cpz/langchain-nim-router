@@ -1,5 +1,6 @@
 """langchain-nim-router: Select the best NVIDIA NIM model for LangChain."""
 
+from nim_router.callbacks import TrackingCallback
 from nim_router.errors import (
     ErrorKind,
     ModelDiscoveryError,
@@ -7,17 +8,19 @@ from nim_router.errors import (
     NoUsableModelError,
     classify_error,
 )
-from nim_router.router import NimRouter, TrackedLLM
+from nim_router.router import NimRouter
 from nim_router.schemas import (
     ModelCapabilities,
     ModelInfo,
     ModelRuntimeStats,
+    ModelSelection,
     RateLimitState,
 )
 
 __all__ = [
     "NimRouter",
-    "TrackedLLM",
+    "TrackingCallback",
+    "ModelSelection",
     "NimRouterError",
     "NoUsableModelError",
     "ModelDiscoveryError",

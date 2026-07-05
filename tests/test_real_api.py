@@ -148,10 +148,11 @@ class TestRealGet:
         assert type(llm).__name__ == "ChatNVIDIA"
 
     @pytest.mark.asyncio
-    async def test_get_tracked_returns_tracked_llm(self, router):
-        llm = await router.get_tracked(tools=True, temperature=0.7)
-        assert type(llm).__name__ == "TrackedLLM"
-        assert type(llm.llm).__name__ == "ChatNVIDIA"
+    async def test_select_returns_model_selection(self, router):
+        sel = await router.select(tools=True, temperature=0.7)
+        assert type(sel.llm).__name__ == "ChatNVIDIA"
+        assert sel.info.id
+        assert sel.callback is not None
 
     @pytest.mark.asyncio
     async def test_get_with_all_params(self, router):

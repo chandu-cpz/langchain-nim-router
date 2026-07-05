@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -17,6 +20,19 @@ class ModelInfo(BaseModel):
     deprecated: bool = False
     model_type: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+
+
+@dataclass
+class ModelSelection:
+    """Bundles the chosen model metadata, a real ChatNVIDIA LLM, and a
+    :class:`~nim_router.callbacks.TrackingCallback` for automatic stats.
+
+    Returned by :meth:`NimRouter.select`.
+    """
+
+    info: ModelInfo
+    llm: Any
+    callback: Any  # TrackingCallback — use Any to avoid circular import
 
 
 class RateLimitState(BaseModel):

@@ -2,23 +2,18 @@
 
 Select the best NVIDIA NIM model for LangChain based on requested capabilities and live runtime history.
 
-## What this package is
+## What this is
 
-A standalone, reusable Python package that answers one question: **"Which NIM model should I use right now?"**
+A small, importable Python package that answers one question: **"Which NIM model should I use right now?"**
 
-Given a set of requirements (tools, structured output, vision, reasoning, speed, quality), it:
+Given requirements (tools, structured output, vision, reasoning, speed vs quality), it:
 
 1. Discovers available NVIDIA NIM models via `ChatNVIDIA.get_available_models()`
-2. Filters by capabilities and availability
+2. Filters by capabilities and availability (cooldowns, bans, RPM limits)
 3. Scores candidates based on runtime stats and priority
-4. Returns a configured `ChatNVIDIA` instance ready to use
+4. Returns a **real `ChatNVIDIA` instance** — not a wrapper
 
-## What this package is not
-
-- Not an agent framework
-- Not tied to any specific application (Z-Apply, DeepAgents, LangGraph, etc.)
-- Not a proxy server
-- Not a replacement for LiteLLM or any routing layer
+Tracking is handled via LangChain callbacks, so it works through any composition: `with_structured_output`, `bind_tools`, LCEL pipes, LangGraph, and `astream_events`.
 
 ## Installation
 
@@ -28,165 +23,57 @@ pip install langchain-nim-router
 
 ## Quickstart
 
+### Selection mode — just get a model
+
 ```python
 from nim_router import NimRouter
 
 router = NimRouter()
+llm = await router.get(tools=True, structured=True, priority="fast")
+response = await llm.ainvoke("Hello, how are you?")
+```
 
-llm = await router.get(
+`get()` returns a genuine `ChatNVIDIA`. Use it anywhere LangChain expects a `BaseChatModel`.
+
+### One-shot tracked mode — select + invoke + auto-track
+
+```python
+response = await router.ainvoke(
+    [{"role": "user", "content": "Hello"}],
     tools=True,
     structured=True,
     priority="fast",
 )
-
-response = await llm.ainvoke("Hello, how are you?")
 ```
 
-## Configuration
+`ainvoke()` selects a model, invokes it, and records latency/errors via a LangChain callback. Failures automatically trigger cooldowns or bans.
 
-Configure via environment variables or programmatic config:
-
-### Environment Variables
-
-```bash
-# Only use these models (comma-separated)
-export NIM_ROUTER_MODEL_POOL="meta/llama-3.3-70b-instruct,meta/llama-3.1-8b-instruct"
-
-# Exclude specific models (comma-separated)
-export NIM_ROUTER_EXCLUDED_MODELS="some/deprecated-model"
-
-# Default requests per minute per model
-export NIM_ROUTER_DEFAULT_RPM=30
-
-# Per-model RPM limits (JSON)
-export NIM_ROUTER_MODEL_RPM_JSON='{"meta/llama-3.3-70b-instruct": 20, "some/slow-model": 5}'
-
-# Capability overrides (JSON)
-export NIM_ROUTER_CAPABILITIES_JSON='{"meta/llama-3.3-70b-instruct": {"tools": true, "structured": true, "vision": false, "reasoning": false}}'
-
-# Quality hints (JSON)
-export NIM_ROUTER_QUALITY_HINTS_JSON='{"meta/llama-3.3-70b-instruct": 0.95, "meta/llama-3.1-8b-instruct": 0.65}'
-
-# Request timeout in seconds
-export NIM_ROUTER_TIMEOUT_SECONDS=60.0
-```
-
-### Programmatic Config
+### Advanced composed chain mode — model + callback
 
 ```python
-from nim_router import NimRouter
-from nim_router.config import RouterConfig
+from pydantic import BaseModel
 
-config = RouterConfig(
-    model_pool=["meta/llama-3.3-70b-instruct", "meta/llama-3.1-8b-instruct"],
-    excluded_models=["some/deprecated-model"],
-    default_rpm=30,
-    model_rpm={"some/slow-model": 5},
-    capabilities_overrides={
-        "meta/llama-3.3-70b-instruct": {
-            "tools": True,
-            "structured": True,
-            "vision": False,
-            "reasoning": False,
-        }
-    },
-    quality_hints={
-        "meta/llama-3.3-70b-instruct": 0.95,
-        "meta/llama-3.1-8b-instruct": 0.65,
-    },
-    timeout_seconds=60.0,
+class MySchema(BaseModel):
+    name: str
+    age: int
+
+selection = await router.select(tools=True, structured=True)
+
+chain = prompt | selection.llm.with_structured_output(MySchema)
+result = await chain.ainvoke(
+    input,
+    config={"callbacks": [selection.callback]},
 )
-
-router = NimRouter(config=config)
 ```
 
-## Capability Overrides
+`select()` returns a `ModelSelection` with the LLM, model info, and a tracking callback. Pass the callback in `config={"callbacks": [...]}` — it propagates through any LangChain composition automatically.
 
-If a model's capabilities are not automatically detected, you can override them:
-
-```json
-{
-  "meta/llama-3.3-70b-instruct": {
-    "tools": true,
-    "structured": true,
-    "vision": false,
-    "reasoning": false
-  },
-  "some/vision-model": {
-    "tools": false,
-    "structured": false,
-    "vision": true,
-    "reasoning": false
-  }
-}
-```
-
-## RPM Overrides
-
-Control per-model rate limits:
-
-```json
-{
-  "meta/llama-3.3-70b-instruct": 20,
-  "some/slow-model": 5
-}
-```
-
-## Runtime Stats
-
-The router tracks per-model statistics:
-
-- **calls**: Total invocations
-- **successes/failures**: Success/failure counts
-- **rate_limits**: Number of 429 errors
-- **avg_latency**: Average response time
-- **avg_tokens_per_second**: Average generation speed
-- **structured_success_rate**: Success rate for structured output
-- **tool_success_rate**: Success rate for tool calls
-- **vision_success_rate**: Success rate for vision tasks
-
-Stats are kept in memory by default. Optionally persist to JSON:
+### Manual overrides
 
 ```python
-router = NimRouter(stats_path="nim_router_stats.json")
+router.ban_model("bad/model")
+router.cooldown_model("slow/model", 60)
 ```
-
-## Rate Limiting and Cooldowns
-
-- **Rate limiting**: Per-model RPM tracking. If a model exceeds its RPM limit, it's temporarily excluded.
-- **Cooldowns**: 429/rate-limit errors cool down a model for 30 seconds. HTTP errors cool down for 10 seconds.
-- **Banning**: 404/model-not-found errors permanently ban a model for the process lifetime.
-
-```python
-# Manual control
-router.ban_model("some/bad-model")
-router.cooldown_model("some/slow-model", 60.0)
-```
-
-## Using with Your Application
-
-This package is designed to be imported and used by any application:
-
-```python
-from nim_router import NimRouter
-
-router = NimRouter()
-
-# Get a fast model with tool support
-llm = await router.get(tools=True, priority="fast")
-response = await llm.ainvoke("Use the weather tool to check today's forecast")
-
-# Get a model for structured output
-llm = await router.get(structured=True, priority="balanced")
-response = await llm.ainvoke("Return a JSON object with name and age")
-
-# Record results for better future selections
-router.record_success(llm.model, latency=1.2, tokens_per_second=45.0)
-# or on failure
-router.record_failure(llm.model, kind="rate_limit")
-```
-
-The router does not perform LLM calls itself. It only selects and configures the model.
 
 ## API Reference
 
@@ -196,22 +83,138 @@ The router does not perform LLM calls itself. It only selects and configures the
 router = NimRouter(config=None, stats_path=None, **config_overrides)
 ```
 
-**Methods:**
+**Core methods:**
 
-- `await router.get(**kwargs)` → `ChatNVIDIA`: Pick a model and return configured instance
-- `await router.pick(**kwargs)` → `ModelInfo`: Pick a model and return metadata
-- `router.record_success(model_id, **kwargs)`: Record successful call
-- `router.record_failure(model_id, error=None, kind=None)`: Record failed call
-- `router.ban_model(model_id)`: Ban a model for this process
-- `router.cooldown_model(model_id, seconds)`: Cool down a model
-- `router.stats()` → `dict`: Get runtime stats snapshot
-- `await router.fast_tools_model(**kwargs)` → `ChatNVIDIA`: Fast model with tools
-- `await router.structured_model(**kwargs)` → `ChatNVIDIA`: Model for structured output
-- `await router.vision_model(**kwargs)` → `ChatNVIDIA`: Model with vision
-- `await router.reasoning_model(**kwargs)` → `ChatNVIDIA`: Model with reasoning
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `await router.pick(**caps)` | `ModelInfo` | Pure selection — no LLM, no tracking |
+| `await router.get(**caps)` | `ChatNVIDIA` | Select and return a real LangChain model |
+| `await router.select(**caps)` | `ModelSelection` | Select + LLM + tracking callback |
+| `await router.ainvoke(messages, **caps)` | `Any` | One-shot: select + invoke + auto-track |
+| `router.tracker_for(model_id)` | `TrackingCallback` | Create a callback bound to a model |
 
-### Priority Modes
+**Capability parameters** (shared by all methods above):
+
+- `tools=False` — require tool/function calling
+- `structured=False` — require structured output
+- `vision=False` — require image understanding
+- `reasoning=False` — require reasoning/thinking
+- `priority="balanced"` — `"fast"`, `"quality"`, or `"balanced"`
+
+**Admin methods:**
+
+- `router.ban_model(model_id)` — permanently ban a model
+- `router.cooldown_model(model_id, seconds)` — temporarily cool down
+- `router.record_success(model_id, ...)` — manual success recording
+- `router.record_failure(model_id, error=...)` — manual failure recording
+- `router.stats()` — snapshot of all runtime stats
+
+**Convenience helpers:**
+
+- `await router.fast_tools_model()` — fast model with tools
+- `await router.structured_model()` — model for structured output
+- `await router.vision_model()` — model with vision
+- `await router.reasoning_model()` — model with reasoning
+
+### `ModelSelection`
+
+```python
+@dataclass
+class ModelSelection:
+    info: ModelInfo        # model metadata
+    llm: Any              # real ChatNVIDIA
+    callback: TrackingCallback  # LangChain callback for auto-tracking
+```
+
+### `TrackingCallback`
+
+A LangChain `BaseCallbackHandler` that records latency, token usage, and errors back to the router. Created via `router.tracker_for()` or `router.select()`.
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# Only use these models (comma-separated)
+NIM_ROUTER_MODEL_POOL="meta/llama-3.3-70b-instruct,meta/llama-3.1-8b-instruct"
+
+# Exclude specific models (comma-separated)
+NIM_ROUTER_EXCLUDED_MODELS="some/deprecated-model"
+
+# Default requests per minute per model
+NIM_ROUTER_DEFAULT_RPM=30
+
+# Per-model RPM limits (JSON)
+NIM_ROUTER_MODEL_RPM_JSON='{"meta/llama-3.3-70b-instruct": 20}'
+
+# Capability overrides (JSON)
+NIM_ROUTER_CAPABILITIES_JSON='{"model-id": {"tools": true, "structured": true}}'
+
+# Quality hints (JSON)
+NIM_ROUTER_QUALITY_HINTS_JSON='{"model-id": 0.95}'
+
+# Request timeout in seconds
+NIM_ROUTER_TIMEOUT_SECONDS=120.0
+
+# Allow override-only models not discovered from API (default: false)
+NIM_ROUTER_ALLOW_UNDISCOVERED=1
+```
+
+### Programmatic Config
+
+```python
+from nim_router import NimRouter
+from nim_router.config import RouterConfig
+
+config = RouterConfig(
+    model_pool=["meta/llama-3.3-70b-instruct"],
+    excluded_models=["some/deprecated-model"],
+    default_rpm=30,
+    quality_hints={"meta/llama-3.3-70b-instruct": 0.95},
+    timeout_seconds=60.0,
+    allow_undiscovered_models=False,
+)
+router = NimRouter(config=config)
+```
+
+## How tracking works
+
+The router uses LangChain's callback system — no wrappers, no monkey-patching:
+
+1. `ainvoke()` and `select()` create a `TrackingCallback` bound to the chosen model
+2. The callback fires on `on_chat_model_start` (marks rate-limit slot) and `on_llm_end` / `on_llm_error` (records stats)
+3. Stats feed back into scoring, so future picks prefer models with better history
+4. Errors trigger automatic cooldowns (rate-limit, timeout, HTTP) or bans (404)
+
+Callbacks propagate through any LangChain composition — `with_structured_output()`, `bind_tools()`, LCEL `|` pipes, and agent chains — without any extra code.
+
+## Rate limiting and cooldowns
+
+- **RPM**: Per-model requests-per-minute tracking. Excluded when limit hit.
+- **Rate-limit (429)**: 30-second cooldown
+- **Timeout**: 20-second cooldown
+- **HTTP error**: 10-second cooldown
+- **Model not found (404)**: permanent ban for process lifetime
+
+## Runtime stats
+
+Tracked per model: `calls`, `successes`, `failures`, `rate_limits`, `avg_latency`, `avg_tokens_per_second`, `structured_success_rate`, `tool_success_rate`, `vision_success_rate`.
+
+Persist to JSON:
+
+```python
+router = NimRouter(stats_path="nim_router_stats.json")
+```
+
+## Priority modes
 
 - **`fast`**: Prefer low latency and high tokens/second
 - **`quality`**: Prefer high quality hint and success rate
 - **`balanced`**: Blend speed, reliability, and quality
+
+## What this is not
+
+- Not an agent framework
+- Not a proxy server
+- Not a LiteLLM replacement
+- Not tied to any specific application
