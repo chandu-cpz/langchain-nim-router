@@ -143,6 +143,52 @@ class TestSelect:
             assert sel.callback._structured is True
 
 
+# ── lease ────────────────────────────────────────────────────────────
+
+
+class TestLease:
+    @pytest.mark.asyncio
+    async def test_lease_returns_model_selection(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_llm = MagicMock()
+            mock_create.return_value = mock_llm
+            sel = await router_with_mock.lease(tools=True, structured=True)
+
+            assert isinstance(sel, ModelSelection)
+            assert sel.info.capabilities.tools is True
+            assert sel.llm is mock_llm
+            assert isinstance(sel.callback, TrackingCallback)
+            # lease uses mark_request_on_start=False so it never double-marks.
+            assert sel.callback._mark_request_on_start is False
+
+    @pytest.mark.asyncio
+    async def test_lease_reserves_rpm_slot(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia", return_value=MagicMock()):
+            sel = await router_with_mock.lease(tools=True)
+
+        state = router_with_mock.limiter.get_state(sel.info.id)
+        assert len(state.recent_request_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_lease_does_not_invoke_model(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia") as mock_create:
+            mock_create.return_value = MagicMock()
+            sel = await router_with_mock.lease(tools=True)
+
+        # Lease must not call ainvoke/stream on the produced LLM.
+        assert sel.llm.ainvoke.call_count == 0
+        assert sel.llm.astream.call_count == 0
+
+
 # ── tracker_for ──────────────────────────────────────────────────────
 
 
@@ -196,7 +242,8 @@ class TestTrackingCallback:
 
         cb = router_with_mock.tracker_for("model-a", tools=True)
         from uuid import uuid4
-        from langchain_core.outputs import LLMResult, Generation
+
+        from langchain_core.outputs import Generation, LLMResult
         run_id = uuid4()
         cb.on_chat_model_start({}, [], run_id=run_id)
 

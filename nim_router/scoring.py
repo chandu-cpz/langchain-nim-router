@@ -60,6 +60,33 @@ def score_models(
     return scored
 
 
+def prioritize_initial_exploration(
+    candidates: list[ModelInfo],
+    limiter: RateLimiter,
+    stats_store: StatsStore,
+    *,
+    attempts_per_model: int,
+) -> list[ModelInfo]:
+    """Prefer eligible models not yet tried in this router's lifetime.
+
+    Runtime stats and limiter state belong to one ``NimRouter`` instance. In
+    the usual application integration that is one run, so this gives each
+    eligible model a deterministic first attempt before normal score-based
+    reuse begins. A request reservation counts as an attempt immediately so
+    concurrent leases cannot repeatedly choose the same untried model.
+    """
+    if attempts_per_model <= 0:
+        return candidates
+
+    untried = [
+        model
+        for model in candidates
+        if stats_store.get_stats(model.id).calls < attempts_per_model
+        and len(limiter.get_state(model.id).recent_request_timestamps) < attempts_per_model
+    ]
+    return untried or candidates
+
+
 def _compute_score(
     model: ModelInfo,
     stats: ModelRuntimeStats,

@@ -12,7 +12,7 @@ from nim_router.errors import ErrorKind, NoUsableModelError, classify_error
 from nim_router.limiter import RateLimiter
 from nim_router.registry import ModelRegistry
 from nim_router.schemas import ModelCapabilities, ModelInfo, ModelSelection
-from nim_router.scoring import filter_candidates, score_models
+from nim_router.scoring import filter_candidates, prioritize_initial_exploration, score_models
 from nim_router.stats import StatsStore
 
 logger = logging.getLogger(__name__)
@@ -119,13 +119,32 @@ class NimRouter:
                     excluded_reasons=reasons,
                 )
 
+            exploration_candidates = prioritize_initial_exploration(
+                candidates,
+                self.limiter,
+                self.stats_store,
+                attempts_per_model=self.config.initial_exploration_attempts,
+            )
             scored = score_models(
-                candidates, self.stats_store, priority, required=required
+                exploration_candidates, self.stats_store, priority, required=required
             )
             best = scored[0][0]
 
             if reserve:
                 self.limiter.mark_request(best.id)
+
+            logger.info(
+                "Selected model %s (priority=%s, tools=%s, structured=%s, vision=%s, "
+                "reasoning=%s, candidates=%d, exploring=%s)",
+                best.id,
+                priority,
+                tools,
+                structured,
+                vision,
+                reasoning,
+                len(candidates),
+                len(exploration_candidates) < len(candidates),
+            )
 
             return best
 
@@ -213,6 +232,63 @@ class NimRouter:
             structured=structured,
             vision=vision,
             reasoning=reasoning,
+        )
+        return ModelSelection(info=info, llm=llm, callback=callback)
+
+    async def lease(
+        self,
+        *,
+        tools: bool = False,
+        structured: bool = False,
+        vision: bool = False,
+        reasoning: bool = False,
+        priority: Literal["fast", "quality", "balanced"] = "balanced",
+        max_completion_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        model_kwargs: dict[str, Any] | None = None,
+    ) -> ModelSelection:
+        """Select a model and create LLM + tracking callback *without* invoking.
+
+        Returns a :class:`ModelSelection` for use by callers (e.g. middleware)
+        that drive the actual model call themselves and want to record
+        success/failure explicitly.
+
+        Differences from :meth:`select`:
+
+        * Reserves a rate-limit slot atomically inside the pick lock
+          (``reserve=True``) so concurrent leases distribute across models.
+        * The returned callback uses ``mark_request_on_start=False`` — the
+          slot is already reserved, so the callback must not mark again.
+        * Does **not** invoke the model and does **not** release RPM slots
+          afterward. RPM accounting is request-window based; failed requests
+          still count.
+        """
+        info = await self._pick(
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            priority=priority,
+            reserve=True,
+        )
+        llm = create_chat_nvidia(
+            model_id=info.id,
+            temperature=temperature,
+            top_p=top_p,
+            max_completion_tokens=max_completion_tokens,
+            timeout=self.config.timeout_seconds,
+            patch_timeout=self.config.patch_timeout,
+            model_kwargs=model_kwargs,
+        )
+        callback = TrackingCallback(
+            self,
+            info.id,
+            tools=tools,
+            structured=structured,
+            vision=vision,
+            reasoning=reasoning,
+            mark_request_on_start=False,
         )
         return ModelSelection(info=info, llm=llm, callback=callback)
 

@@ -18,6 +18,7 @@ class RouterConfig(BaseModel):
     stats_path: str | None = None
     allow_undiscovered_models: bool = False
     patch_timeout: bool = True
+    initial_exploration_attempts: int = 1
 
     @classmethod
     def from_env(cls) -> RouterConfig:
@@ -33,6 +34,9 @@ class RouterConfig(BaseModel):
             stats_path=os.environ.get("NIM_ROUTER_STATS_PATH"),
             allow_undiscovered_models=_parse_bool("NIM_ROUTER_ALLOW_UNDISCOVERED", False),
             patch_timeout=_parse_bool("NIM_ROUTER_PATCH_TIMEOUT", True),
+            initial_exploration_attempts=_parse_int(
+                "NIM_ROUTER_INITIAL_EXPLORATION_ATTEMPTS", 1
+            ),
         )
 
 

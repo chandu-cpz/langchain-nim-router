@@ -5,7 +5,7 @@ import pytest
 from nim_router.config import RouterConfig
 from nim_router.limiter import RateLimiter
 from nim_router.schemas import ModelCapabilities, ModelInfo
-from nim_router.scoring import filter_candidates, score_models
+from nim_router.scoring import filter_candidates, prioritize_initial_exploration, score_models
 from nim_router.stats import StatsStore
 
 
@@ -187,6 +187,35 @@ def test_new_model_gets_neutral_defaults():
     assert len(scored) == 1
     score = scored[0][1]
     assert 0.4 <= score <= 0.6
+
+
+def test_initial_exploration_prefers_each_untried_model_once():
+    models = [_make_model("a", tools=True), _make_model("b", tools=True)]
+    limiter = RateLimiter(RouterConfig())
+    stats = StatsStore()
+
+    first = prioritize_initial_exploration(
+        models, limiter, stats, attempts_per_model=1
+    )
+    assert [model.id for model in first] == ["a", "b"]
+
+    limiter.mark_request("a")
+    stats.record_success("a")
+    second = prioritize_initial_exploration(
+        models, limiter, stats, attempts_per_model=1
+    )
+    assert [model.id for model in second] == ["b"]
+
+
+def test_initial_exploration_can_be_disabled():
+    models = [_make_model("a", tools=True), _make_model("b", tools=True)]
+    limiter = RateLimiter(RouterConfig())
+    stats = StatsStore()
+
+    result = prioritize_initial_exploration(
+        models, limiter, stats, attempts_per_model=0
+    )
+    assert result == models
 
 
 def test_capability_penalty_structured():
