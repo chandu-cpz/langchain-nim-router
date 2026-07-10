@@ -87,6 +87,21 @@ def prioritize_initial_exploration(
     return untried or candidates
 
 
+def scheduled_exploration_candidate(
+    candidates: list[ModelInfo],
+    stats_store: StatsStore,
+) -> ModelInfo:
+    """Choose the least-observed eligible model for a scheduled probe."""
+    return min(
+        candidates,
+        key=lambda model: (
+            stats_store.get_stats(model.id).calls,
+            stats_store.get_stats(model.id).last_used_at or 0.0,
+            model.id,
+        ),
+    )
+
+
 def _compute_score(
     model: ModelInfo,
     stats: ModelRuntimeStats,

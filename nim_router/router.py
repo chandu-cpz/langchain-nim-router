@@ -12,7 +12,12 @@ from nim_router.errors import ErrorKind, NoUsableModelError, classify_error
 from nim_router.limiter import RateLimiter
 from nim_router.registry import ModelRegistry
 from nim_router.schemas import ModelCapabilities, ModelInfo, ModelSelection
-from nim_router.scoring import filter_candidates, prioritize_initial_exploration, score_models
+from nim_router.scoring import (
+    filter_candidates,
+    prioritize_initial_exploration,
+    scheduled_exploration_candidate,
+    score_models,
+)
 from nim_router.stats import StatsStore
 
 logger = logging.getLogger(__name__)
@@ -119,16 +124,22 @@ class NimRouter:
                     excluded_reasons=reasons,
                 )
 
-            exploration_candidates = prioritize_initial_exploration(
-                candidates,
-                self.limiter,
-                self.stats_store,
-                attempts_per_model=self.config.initial_exploration_attempts,
+            scheduled_exploration = self.stats_store.claim_exploration(
+                self.config.exploration_interval_seconds
             )
-            scored = score_models(
-                exploration_candidates, self.stats_store, priority, required=required
-            )
-            best = scored[0][0]
+            if scheduled_exploration:
+                best = scheduled_exploration_candidate(candidates, self.stats_store)
+            else:
+                exploration_candidates = prioritize_initial_exploration(
+                    candidates,
+                    self.limiter,
+                    self.stats_store,
+                    attempts_per_model=self.config.initial_exploration_attempts,
+                )
+                scored = score_models(
+                    exploration_candidates, self.stats_store, priority, required=required
+                )
+                best = scored[0][0]
 
             if reserve:
                 self.limiter.mark_request(best.id)
@@ -143,7 +154,7 @@ class NimRouter:
                 vision,
                 reasoning,
                 len(candidates),
-                len(exploration_candidates) < len(candidates),
+                scheduled_exploration or len(exploration_candidates) < len(candidates),
             )
 
             return best

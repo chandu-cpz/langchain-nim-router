@@ -19,6 +19,7 @@ class RouterConfig(BaseModel):
     allow_undiscovered_models: bool = False
     patch_timeout: bool = True
     initial_exploration_attempts: int = 1
+    exploration_interval_seconds: float = 900.0
 
     @classmethod
     def from_env(cls) -> RouterConfig:
@@ -36,6 +37,9 @@ class RouterConfig(BaseModel):
             patch_timeout=_parse_bool("NIM_ROUTER_PATCH_TIMEOUT", True),
             initial_exploration_attempts=_parse_int(
                 "NIM_ROUTER_INITIAL_EXPLORATION_ATTEMPTS", 1
+            ),
+            exploration_interval_seconds=_parse_float(
+                "NIM_ROUTER_EXPLORATION_INTERVAL_SECONDS", 900.0
             ),
         )
 

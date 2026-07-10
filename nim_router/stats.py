@@ -18,6 +18,7 @@ class StatsStore:
 
     def __init__(self, stats_path: str | None = None) -> None:
         self._stats: dict[str, ModelRuntimeStats] = {}
+        self._last_exploration_at: float | None = None
         self._stats_path = Path(stats_path) if stats_path else None
         if self._stats_path and self._stats_path.exists():
             self._load()
@@ -27,7 +28,15 @@ class StatsStore:
             return
         try:
             raw = json.loads(self._stats_path.read_text())
-            for model_id, data in raw.items():
+            records = raw.get("models", raw)
+            if not isinstance(records, dict):
+                raise ValueError("Router stats models must be an object")
+            router = raw.get("router", {})
+            if isinstance(router, dict):
+                last_exploration_at = router.get("last_exploration_at")
+                if isinstance(last_exploration_at, int | float):
+                    self._last_exploration_at = float(last_exploration_at)
+            for model_id, data in records.items():
                 self._stats[model_id] = ModelRuntimeStats(**data)
         except Exception:
             logger.warning("Failed to load stats from %s", self._stats_path)
@@ -37,7 +46,10 @@ class StatsStore:
             return
         try:
             self._stats_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {k: v.model_dump() for k, v in self._stats.items()}
+            data = {
+                "router": {"last_exploration_at": self._last_exploration_at},
+                "models": {k: v.model_dump() for k, v in self._stats.items()},
+            }
             # Atomic write: write to temp file then rename
             tmp_path = self._stats_path.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(data, indent=2))
@@ -131,6 +143,25 @@ class StatsStore:
 
     def snapshot(self) -> dict[str, ModelRuntimeStats]:
         return dict(self._stats)
+
+    def claim_exploration(self, interval_seconds: float, *, now: float | None = None) -> bool:
+        """Atomically reserve the next scheduled exploration slot.
+
+        The router calls this while holding its selection lock. Persisting the
+        reservation prevents separate process runs sharing the stats file from
+        probing on every startup.
+        """
+        if interval_seconds <= 0:
+            return False
+        current = time.time() if now is None else now
+        if (
+            self._last_exploration_at is not None
+            and current - self._last_exploration_at < interval_seconds
+        ):
+            return False
+        self._last_exploration_at = current
+        self._save()
+        return True
 
     def is_banned(self, model_id: str) -> bool:
         return self._stats.get(model_id, ModelRuntimeStats()).banned
