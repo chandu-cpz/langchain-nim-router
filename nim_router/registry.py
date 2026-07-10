@@ -17,114 +17,10 @@ _chat_nvidia_cls: Any = None
 
 def _merge_capabilities(
     raw_model: Any,
-    model_id: str,
     overrides: dict[str, bool],
 ) -> ModelCapabilities:
-    """Build capabilities with three-tier priority.
-
-    1. Raw API metadata (lowest — may be incomplete)
-    2. Built-in profile (fills gaps where API says False)
-    3. Env / programmatic overrides (highest)
-
-    A capability is True if ANY source says True.
-    """
-    # Layer 1: raw metadata
-    api_caps = infer_capabilities(raw_model)
-
-    # Layer 2: built-in profile
-    profile = DEFAULT_MODEL_PROFILES.get(model_id)
-
-    result = ModelCapabilities()
-    for field_name in ("tools", "structured", "vision", "reasoning"):
-        api_val = getattr(api_caps, field_name, False)
-        profile_val = bool(profile.get(field_name, False)) if profile else False
-        override_val = overrides.get(field_name) if field_name in overrides else None
-
-        if override_val is not None:
-            # Env/programmatic override wins outright
-            setattr(result, field_name, bool(override_val))
-        else:
-            # API metadata OR built-in profile (either True → True)
-            setattr(result, field_name, api_val or profile_val)
-
-    return result
-
-# Built-in profiles for well-known NIM models.
-# quality: 0-1 hint used by scoring when no runtime history exists.
-# speed_hint: informational only (scoring derives speed from real latency).
-# Env overrides (NIM_ROUTER_QUALITY_HINTS_JSON) always win over these.
-DEFAULT_MODEL_PROFILES: dict[str, dict[str, Any]] = {
-    "openai/gpt-oss-120b": {
-        "quality": 0.90,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": True,
-    },
-    "meta/llama-3.3-70b-instruct": {
-        "quality": 0.85,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-    "meta/llama-3.1-70b-instruct": {
-        "quality": 0.82,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-    "meta/llama-3.1-8b-instruct": {
-        "quality": 0.70,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-    "nvidia/llama-3.1-nemotron-70b-instruct": {
-        "quality": 0.88,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-    "nvidia/nemotron-3-nano-30b-a3b": {
-        "quality": 0.78,
-        "tools": False,
-        "structured": True,
-        "vision": False,
-        "reasoning": True,
-    },
-    "meta/llama-3.2-11b-vision-instruct": {
-        "quality": 0.72,
-        "tools": False,
-        "structured": False,
-        "vision": True,
-        "reasoning": False,
-    },
-    "meta/llama-3.2-90b-vision-instruct": {
-        "quality": 0.82,
-        "tools": False,
-        "structured": False,
-        "vision": True,
-        "reasoning": False,
-    },
-    "mistralai/mistral-large-2-instruct": {
-        "quality": 0.87,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-    "google/gemma-2-27b-it": {
-        "quality": 0.78,
-        "tools": True,
-        "structured": True,
-        "vision": False,
-        "reasoning": False,
-    },
-}
+    """Use provider metadata, with explicit user overrides as the sole override."""
+    return infer_capabilities(raw_model, overrides)
 
 
 def _get_chat_nvidia_cls() -> Any:
@@ -193,15 +89,11 @@ class ModelRegistry:
             # Deprecated models
             deprecated = bool(getattr(raw, "deprecated", False))
 
-            # Build capabilities: raw API metadata → built-in profile → env override
+            # Build capabilities from provider metadata and explicit overrides.
             cap_overrides = self.config.capabilities_overrides.get(model_id, {})
-            capabilities = _merge_capabilities(raw, model_id, cap_overrides)
+            capabilities = _merge_capabilities(raw, cap_overrides)
 
-            # Quality hint: env override > built-in profile > neutral default
-            profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
-            quality_hint = self.config.quality_hints.get(
-                model_id, profile.get("quality", 0.5)
-            )
+            quality_hint = self.config.quality_hints.get(model_id, 0.5)
 
             info = ModelInfo(
                 id=model_id,
@@ -234,10 +126,7 @@ class ModelRegistry:
                 if any(m.id == model_id for m in models):
                     continue
                 capabilities = infer_capabilities({}, overrides)
-                profile = DEFAULT_MODEL_PROFILES.get(model_id, {})
-                quality_hint = self.config.quality_hints.get(
-                    model_id, profile.get("quality", 0.5)
-                )
+                quality_hint = self.config.quality_hints.get(model_id, 0.5)
                 models.append(
                     ModelInfo(
                         id=model_id,

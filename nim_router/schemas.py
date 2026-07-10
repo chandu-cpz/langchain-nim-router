@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +24,7 @@ class ModelInfo(BaseModel):
 
 if TYPE_CHECKING:
     from langchain_core.language_models.chat_models import BaseChatModel
+
     from nim_router.callbacks import TrackingCallback
 
 
@@ -36,8 +37,8 @@ class ModelSelection:
     """
 
     info: ModelInfo
-    llm: "BaseChatModel"
-    callback: "TrackingCallback"
+    llm: BaseChatModel
+    callback: TrackingCallback
 
 
 class RateLimitState(BaseModel):
