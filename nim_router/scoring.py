@@ -118,7 +118,7 @@ def _compute_score(
     if priority == "fast":
         base = (
             0.40 * tok_speed
-            + 0.30 * (1.0 - latency)
+            + 0.30 * latency
             + 0.20 * success
             + 0.10 * quality
         )
@@ -127,14 +127,14 @@ def _compute_score(
             0.40 * quality
             + 0.30 * success
             + 0.15 * tok_speed
-            + 0.15 * (1.0 - latency)
+            + 0.15 * latency
         )
     else:  # balanced
         base = (
             0.25 * quality
             + 0.25 * success
             + 0.25 * tok_speed
-            + 0.25 * (1.0 - latency)
+            + 0.25 * latency
         )
 
     # Apply capability-specific penalties

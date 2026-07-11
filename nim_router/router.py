@@ -62,6 +62,7 @@ class NimRouter:
         self.limiter = RateLimiter(self.config)
         self.stats_store = StatsStore(stats_path=self.config.stats_path)
         self._pick_lock = asyncio.Lock()
+        self._requests_since_exploration = 0
 
     # ── Selection ────────────────────────────────────────────────────
 
@@ -124,12 +125,19 @@ class NimRouter:
                     excluded_reasons=reasons,
                 )
 
+            self._requests_since_exploration += 1
+            request_interval = self.config.exploration_interval_requests
+            request_exploration = (
+                request_interval > 0
+                and self._requests_since_exploration >= request_interval
+            )
             scheduled_exploration = self.stats_store.claim_exploration(
                 self.config.exploration_interval_seconds
-            )
+            ) or request_exploration
             if scheduled_exploration:
                 best = scheduled_exploration_candidate(candidates, self.stats_store)
                 exploring = True
+                self._requests_since_exploration = 0
             else:
                 exploration_candidates = prioritize_initial_exploration(
                     candidates,

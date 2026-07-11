@@ -41,6 +41,44 @@ def _make_fake_models():
 
 class TestPick:
     @pytest.mark.asyncio
+    async def test_request_interval_explores_least_observed_candidate(
+        self, router_with_mock
+    ):
+        router_with_mock.config.initial_exploration_attempts = 0
+        router_with_mock.config.exploration_interval_requests = 2
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+        router_with_mock.stats_store.claim_exploration(
+            router_with_mock.config.exploration_interval_seconds
+        )
+        for _ in range(10):
+            router_with_mock.record_success(
+                "meta/llama-3.1-8b-instruct",
+                latency=0.5,
+                tokens_per_second=30.0,
+                tools=True,
+            )
+        router_with_mock.record_success(
+            "meta/llama-3.3-70b-instruct",
+            latency=5.0,
+            tokens_per_second=30.0,
+            tools=True,
+        )
+        for _ in range(2):
+            router_with_mock.record_success(
+                "nvidia/llama-3.1-nemotron-70b-instruct",
+                latency=5.0,
+                tokens_per_second=30.0,
+                tools=True,
+            )
+
+        first = await router_with_mock.pick(tools=True, priority="fast")
+        second = await router_with_mock.pick(tools=True, priority="fast")
+
+        assert first.id == "meta/llama-3.1-8b-instruct"
+        assert second.id == "meta/llama-3.3-70b-instruct"
+
+    @pytest.mark.asyncio
     async def test_pick_reports_initial_exploration_for_fully_untried_pool(
         self, router_with_mock, caplog
     ):

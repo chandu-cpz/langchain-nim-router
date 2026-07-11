@@ -138,12 +138,12 @@ def test_filter_impossible_capability():
 
 def test_scoring_fast_prefers_speed():
     models = [
-        _make_model("a", tools=True, quality_hint=0.9),
-        _make_model("b", tools=True, quality_hint=0.3),
+        _make_model("a", tools=True, quality_hint=0.5),
+        _make_model("b", tools=True, quality_hint=0.5),
     ]
     stats = StatsStore()
-    stats.record_success("a", latency=3.0, tokens_per_second=20.0)
-    stats.record_success("b", latency=0.5, tokens_per_second=80.0)
+    stats.record_success("a", latency=3.0, tokens_per_second=30.0)
+    stats.record_success("b", latency=0.5, tokens_per_second=30.0)
 
     scored = score_models(models, stats, priority="fast")
     assert scored[0][0].id == "b"
