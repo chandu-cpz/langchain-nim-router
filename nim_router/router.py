@@ -129,6 +129,7 @@ class NimRouter:
             )
             if scheduled_exploration:
                 best = scheduled_exploration_candidate(candidates, self.stats_store)
+                exploring = True
             else:
                 exploration_candidates = prioritize_initial_exploration(
                     candidates,
@@ -140,6 +141,7 @@ class NimRouter:
                     exploration_candidates, self.stats_store, priority, required=required
                 )
                 best = scored[0][0]
+                exploring = exploration_candidates is not candidates
 
             if reserve:
                 self.limiter.mark_request(best.id)
@@ -154,7 +156,7 @@ class NimRouter:
                 vision,
                 reasoning,
                 len(candidates),
-                scheduled_exploration or len(exploration_candidates) < len(candidates),
+                exploring,
             )
 
             return best

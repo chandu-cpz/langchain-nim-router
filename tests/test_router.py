@@ -41,6 +41,21 @@ def _make_fake_models():
 
 class TestPick:
     @pytest.mark.asyncio
+    async def test_pick_reports_initial_exploration_for_fully_untried_pool(
+        self, router_with_mock, caplog
+    ):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+        router_with_mock.stats_store.claim_exploration(
+            router_with_mock.config.exploration_interval_seconds
+        )
+
+        with caplog.at_level("INFO", logger="nim_router.router"):
+            await router_with_mock.pick(tools=True)
+
+        assert "candidates=3, exploring=True" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_pick_tools_model(self, router_with_mock):
         router_with_mock.registry._loaded = True
         router_with_mock.registry._models = _build_model_infos()
