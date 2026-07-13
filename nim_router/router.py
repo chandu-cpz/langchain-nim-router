@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_COOLDOWN = 30.0
 _HTTP_ERROR_COOLDOWN = 10.0
 _TIMEOUT_COOLDOWN = 20.0
+_NETWORK_COOLDOWN = 5.0
 _MODEL_NOT_FOUND_BAN = True
 
 
@@ -279,8 +280,9 @@ class NimRouter:
 
         * Reserves a rate-limit slot atomically inside the pick lock
           (``reserve=True``) so concurrent leases distribute across models.
-        * The returned callback uses ``mark_request_on_start=False`` — the
-          slot is already reserved, so the callback must not mark again.
+        * The returned callback consumes the pre-reserved slot for its first
+          invocation and records every later invocation when a caller keeps
+          the selection sticky across an agent tool loop.
         * Does **not** invoke the model and does **not** release RPM slots
           afterward. RPM accounting is request-window based; failed requests
           still count.
@@ -309,7 +311,8 @@ class NimRouter:
             structured=structured,
             vision=vision,
             reasoning=reasoning,
-            mark_request_on_start=False,
+            mark_request_on_start=True,
+            pre_reserved_requests=1,
         )
         return ModelSelection(info=info, llm=llm, callback=callback)
 
@@ -452,6 +455,9 @@ class NimRouter:
         elif kind == ErrorKind.HTTP_ERROR:
             self.limiter.cooldown(model_id, _HTTP_ERROR_COOLDOWN)
             self.stats_store.cooldown_model(model_id, _HTTP_ERROR_COOLDOWN)
+        elif kind == ErrorKind.NETWORK:
+            self.limiter.cooldown(model_id, _NETWORK_COOLDOWN)
+            self.stats_store.cooldown_model(model_id, _NETWORK_COOLDOWN)
 
     # ── Admin overrides ──────────────────────────────────────────────
 

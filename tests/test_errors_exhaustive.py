@@ -60,7 +60,7 @@ class TestStatusCodeAttribute:
     def test_410_gone(self):
         class E(Exception):
             status_code = 410
-        assert classify_error(E("gone")) == ErrorKind.HTTP_ERROR
+        assert classify_error(E("gone")) == ErrorKind.MODEL_NOT_FOUND
 
     def test_413_payload_too_large(self):
         class E(Exception):
@@ -236,6 +236,16 @@ class TestMessageBasedDetection:
 
     def test_no_message(self):
         assert classify_error(Exception()) == ErrorKind.GENERIC
+
+    def test_dns_resolution_failure(self):
+        assert (
+            classify_error(Exception("Temporary failure in name resolution"))
+            == ErrorKind.NETWORK
+        )
+
+    def test_http_client_connect_error(self):
+        connect_error = type("ConnectError", (Exception,), {})
+        assert classify_error(connect_error("connection failed")) == ErrorKind.NETWORK
 
 
 # =============================================================================

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -214,8 +215,10 @@ class TestLease:
             assert sel.info.capabilities.tools is True
             assert sel.llm is mock_llm
             assert isinstance(sel.callback, TrackingCallback)
-            # lease uses mark_request_on_start=False so it never double-marks.
-            assert sel.callback._mark_request_on_start is False
+            # The first request consumes the atomic reservation; later sticky
+            # invocations are marked normally for accurate RPM accounting.
+            assert sel.callback._mark_request_on_start is True
+            assert sel.callback._pre_reserved_requests == 1
 
     @pytest.mark.asyncio
     async def test_lease_reserves_rpm_slot(self, router_with_mock):
@@ -227,6 +230,20 @@ class TestLease:
 
         state = router_with_mock.limiter.get_state(sel.info.id)
         assert len(state.recent_request_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_sticky_lease_accounts_for_every_later_invocation(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia", return_value=MagicMock()):
+            sel = await router_with_mock.lease(tools=True)
+
+        sel.callback._record_start(uuid4())
+        assert len(router_with_mock.limiter.get_state(sel.info.id).recent_request_timestamps) == 1
+
+        sel.callback._record_start(uuid4())
+        assert len(router_with_mock.limiter.get_state(sel.info.id).recent_request_timestamps) == 2
 
     @pytest.mark.asyncio
     async def test_lease_does_not_invoke_model(self, router_with_mock):

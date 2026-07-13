@@ -33,6 +33,7 @@ class ErrorKind(str, Enum):
     TOOL_CALL_FAILURE = "tool_call_failure"
     VISION_FAILURE = "vision_failure"
     MODEL_NOT_FOUND = "model_not_found"
+    NETWORK = "network"
     GENERIC = "generic"
 
 
@@ -62,7 +63,7 @@ def classify_error(error: BaseException) -> ErrorKind:
     if status is not None:
         if status == 429:
             return ErrorKind.RATE_LIMIT
-        if status == 404:
+        if status in {404, 410}:
             return ErrorKind.MODEL_NOT_FOUND
         if 400 <= status < 600:
             return ErrorKind.HTTP_ERROR
@@ -73,6 +74,19 @@ def classify_error(error: BaseException) -> ErrorKind:
     # Check class name for custom timeout types
     if type(error).__name__ in ("TimeoutError", "AsyncTimeoutError"):
         return ErrorKind.TIMEOUT
+
+    network_error_names = {
+        "ConnectError",
+        "ConnectTimeout",
+        "ClientConnectorError",
+        "ClientConnectionError",
+        "NameResolutionError",
+    }
+    current: BaseException | None = error
+    while current is not None:
+        if type(current).__name__ in network_error_names:
+            return ErrorKind.NETWORK
+        current = current.__cause__ or current.__context__
 
     # ── 3. Message-based fallbacks ─────────────────────────────────
     #    Only when no status code was available
@@ -88,10 +102,13 @@ def classify_error(error: BaseException) -> ErrorKind:
     if "timeout" in msg or "timed out" in msg:
         return ErrorKind.TIMEOUT
 
+    if "name resolution" in msg or "cannot connect to host" in msg:
+        return ErrorKind.NETWORK
+
     if "model not found" in msg or "endpoint not found" in msg:
         return ErrorKind.MODEL_NOT_FOUND
     # Catch "[404]" or "404" embedded in message text
-    if "404" in msg:
+    if "404" in msg or "410" in msg or "gone" in msg:
         return ErrorKind.MODEL_NOT_FOUND
 
     return ErrorKind.GENERIC
