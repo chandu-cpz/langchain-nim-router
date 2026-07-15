@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from nim_router.capabilities import capabilities_satisfy
 from nim_router.limiter import RateLimiter
 from nim_router.schemas import ModelCapabilities, ModelInfo, ModelRuntimeStats
@@ -11,10 +13,15 @@ def filter_candidates(
     required: ModelCapabilities,
     limiter: RateLimiter,
     stats_store: StatsStore,
+    *,
+    excluded_model_ids: Collection[str] = (),
 ) -> list[ModelInfo]:
     """Filter models by capability requirements and availability."""
     result: list[ModelInfo] = []
     for model in models:
+        if model.id in excluded_model_ids:
+            continue
+
         # Skip deprecated
         if model.deprecated:
             continue

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from typing import Any, Literal
 
 from nim_router.callbacks import TrackingCallback
@@ -75,6 +76,7 @@ class NimRouter:
         vision: bool = False,
         reasoning: bool = False,
         priority: Literal["fast", "quality", "balanced"] = "balanced",
+        excluded_model_ids: Collection[str] | None = None,
     ) -> ModelInfo:
         """Select the best model and return its metadata.
 
@@ -84,6 +86,7 @@ class NimRouter:
         return await self._pick(
             tools=tools, structured=structured, vision=vision,
             reasoning=reasoning, priority=priority, reserve=False,
+            excluded_model_ids=excluded_model_ids,
         )
 
     async def _pick(
@@ -95,6 +98,7 @@ class NimRouter:
         reasoning: bool,
         priority: Literal["fast", "quality", "balanced"],
         reserve: bool,
+        excluded_model_ids: Collection[str] | None = None,
     ) -> ModelInfo:
         """Internal pick with optional atomic rate-limit reservation.
 
@@ -104,6 +108,7 @@ class NimRouter:
         """
         async with self._pick_lock:
             models = await self.registry.ensure_loaded()
+            request_exclusions = frozenset(excluded_model_ids or ())
 
             required = ModelCapabilities(
                 tools=tools,
@@ -113,11 +118,19 @@ class NimRouter:
             )
 
             candidates = filter_candidates(
-                models, required, self.limiter, self.stats_store
+                models,
+                required,
+                self.limiter,
+                self.stats_store,
+                excluded_model_ids=request_exclusions,
             )
 
             if not candidates:
-                reasons = self._build_exclusion_reasons(models, required)
+                reasons = self._build_exclusion_reasons(
+                    models,
+                    required,
+                    excluded_model_ids=request_exclusions,
+                )
                 req_dict = required.model_dump()
                 raise NoUsableModelError(
                     f"No usable model found for capabilities: {req_dict}. "
@@ -269,6 +282,7 @@ class NimRouter:
         temperature: float | None = None,
         top_p: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
+        excluded_model_ids: Collection[str] | None = None,
     ) -> ModelSelection:
         """Select a model and create LLM + tracking callback *without* invoking.
 
@@ -294,6 +308,7 @@ class NimRouter:
             reasoning=reasoning,
             priority=priority,
             reserve=True,
+            excluded_model_ids=excluded_model_ids,
         )
         llm = create_chat_nvidia(
             model_id=info.id,
@@ -496,11 +511,17 @@ class NimRouter:
     # ── Internal ─────────────────────────────────────────────────────
 
     def _build_exclusion_reasons(
-        self, models: list[ModelInfo], required: ModelCapabilities
+        self,
+        models: list[ModelInfo],
+        required: ModelCapabilities,
+        *,
+        excluded_model_ids: Collection[str] = (),
     ) -> dict[str, list[str]]:
         reasons: dict[str, list[str]] = {}
         for model in models:
             excluded: list[str] = []
+            if model.id in excluded_model_ids:
+                excluded.append("excluded_by_request")
             if model.deprecated:
                 excluded.append("deprecated")
             if self.stats_store.is_banned(model.id):

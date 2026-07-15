@@ -132,6 +132,42 @@ class TestPick:
         assert result.id == "nvidia/llama-3.1-nemotron-70b-instruct"
 
     @pytest.mark.asyncio
+    async def test_pick_honors_request_exclusions_without_mutating_config(
+        self, router_with_mock
+    ):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        selected = await router_with_mock.pick(
+            tools=True,
+            excluded_model_ids={
+                "meta/llama-3.1-8b-instruct",
+                "meta/llama-3.3-70b-instruct",
+            },
+        )
+
+        assert selected.id == "nvidia/llama-3.1-nemotron-70b-instruct"
+        assert router_with_mock.config.excluded_models == []
+
+    @pytest.mark.asyncio
+    async def test_pick_reports_request_exclusions_when_none_remain(
+        self, router_with_mock
+    ):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+        excluded = {
+            model.id
+            for model in router_with_mock.registry._models
+            if model.capabilities.tools
+        }
+
+        with pytest.raises(NoUsableModelError) as captured:
+            await router_with_mock.pick(tools=True, excluded_model_ids=excluded)
+
+        for model_id in excluded:
+            assert "excluded_by_request" in captured.value.excluded_reasons[model_id]
+
+    @pytest.mark.asyncio
     async def test_pick_fast_prefers_speed(self, router_with_mock):
         router_with_mock.registry._loaded = True
         models = _build_model_infos()
@@ -230,6 +266,25 @@ class TestLease:
 
         state = router_with_mock.limiter.get_state(sel.info.id)
         assert len(state.recent_request_timestamps) == 1
+
+    @pytest.mark.asyncio
+    async def test_lease_honors_request_exclusions(self, router_with_mock):
+        router_with_mock.registry._loaded = True
+        router_with_mock.registry._models = _build_model_infos()
+
+        with patch("nim_router.router.create_chat_nvidia", return_value=MagicMock()):
+            selected = await router_with_mock.lease(
+                tools=True,
+                excluded_model_ids={
+                    "meta/llama-3.1-8b-instruct",
+                    "meta/llama-3.3-70b-instruct",
+                },
+            )
+
+        assert selected.info.id == "nvidia/llama-3.1-nemotron-70b-instruct"
+        assert len(
+            router_with_mock.limiter.get_state(selected.info.id).recent_request_timestamps
+        ) == 1
 
     @pytest.mark.asyncio
     async def test_sticky_lease_accounts_for_every_later_invocation(self, router_with_mock):
